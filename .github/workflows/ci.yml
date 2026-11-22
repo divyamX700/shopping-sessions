@@ -105,6 +105,13 @@ jobs:
           e=$(date +%s.%N)
           echo "flags [$flags] wall $(python3 -c "print(round($e-$s,3))") exit-latency $(python3 -c "print(round($e-${r:-0},3))")"
           done; done
+          if docker image inspect base >/dev/null 2>&1; then for k in 1 2; do
+            out=$(mktemp -d); chmod 777 "$out"; s=$(date +%s.%N)
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cpus $N --memory 14g --memory-swap 14g --user 1000:1000 -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$N" base >/dev/null 2>&1 || true
+            e=$(date +%s.%N); echo "base wall $(python3 -c "print(round($e-$s,3))") output $(du -sb $out/user_daily | cut -f1) bytes, $(ls $out/user_daily | wc -l) files; campaign $(du -sb $out/campaign_daily | cut -f1)"
+          done; fi
+          out=$(mktemp -d); chmod 777 "$out"; docker run --rm --user 1000:1000 -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$N" cur >/dev/null 2>&1 || true
+          echo "cur output $(du -sb $out/user_daily | cut -f1) bytes, $(ls $out/user_daily | wc -l) files"
 
       - name: 60M check
         if: ${{ github.event.inputs.big == '1' }}
