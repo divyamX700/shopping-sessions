@@ -242,15 +242,31 @@ fn pool_finish<S: Send>(
 }
 
 /// Bytes [a, b) of `f` read into `buf` (with 64 zero bytes after them).
-fn read_chunk<'b>(f: &std::fs::File, a: usize, b: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
+/// The lines of raw range [a, b) of a `len`-byte file (see `line_span`),
+/// read with one pread (plus a little past b for the last line).
+fn read_chunk<'b>(f: &std::fs::File, a: usize, b: usize, len: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
     use std::os::unix::fs::FileExt;
-    let n = b - a;
-    if buf.len() < n + 64 {
-        buf.resize(n + 64, 0);
+    let lo = a.max(1) - 1;
+    let mut over = 64 << 10;
+    loop {
+        let hi = (b + over).min(len);
+        let n = hi - lo;
+        if buf.len() < n + 64 {
+            buf.resize(n + 64, 0);
+        }
+        f.read_exact_at(&mut buf[..n], lo as u64).expect("read input");
+        buf[n..n + 64].fill(0);
+        if let Some((s, e)) = line_span(&buf[..n], lo, a, b, len) {
+            return &buf[s..e];
+        }
+        over *= 4;
     }
-    f.read_exact_at(&mut buf[..n], a as u64).expect("read input");
-    buf[n..n + 64].fill(0);
-    &buf[..n]
+}
+
+/// The lines of raw range [a, b) of a mapped file.
+fn map_chunk(m: &[u8], a: usize, b: usize) -> &[u8] {
+    let (s, e) = line_span(m, 0, a, b, m.len()).expect("whole file");
+    &m[s..e]
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -290,25 +306,45 @@ fn readahead_all(maps: &[&Mmap]) {
     }
 }
 
-/// Newline-aligned byte ranges (file index, start, end) of every body.
+/// Raw byte ranges (file index, start, end) of every file, CHUNK bytes each.
+/// Nothing is read here: with a cold page cache a serial scan for line ends
+/// cost ~1.5 s of single-threaded disk reads. Each worker moves its own
+/// range's ends to line boundaries (`line_span`).
 fn chunks(maps: &[Mmap]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
     for (fi, m) in maps.iter().enumerate() {
         let len = m.len();
-        let mut pos = len - body(m).len();
+        let mut pos = 0;
         while pos < len {
-            let mut end = (pos + CHUNK).min(len);
-            if end < len {
-                end = match memchr::memchr(b'\n', &m[end..]) {
-                    Some(i) => end + i + 1,
-                    None => len,
-                };
-            }
+            let end = (pos + CHUNK).min(len);
             out.push((fi, pos, end));
             pos = end;
         }
     }
     out
+}
+
+/// The lines a raw range [a, b) owns, within `s` = file bytes [lo, ..):
+/// those starting in (a-1, b-1] after a newline, i.e. from just after the
+/// first newline at or past a-1 (or the header line if a = 0) to just after
+/// the first newline at or past b-1 (or the file end). Neighbouring ranges
+/// therefore meet exactly. None: `s` ends before the end line is found.
+fn line_span(s: &[u8], lo: usize, a: usize, b: usize, len: usize) -> Option<(usize, usize)> {
+    let from = a.max(1) - 1 - lo;
+    let start = match memchr::memchr(b'\n', &s[from..]) {
+        Some(i) => from + i + 1,
+        None if lo + s.len() >= len => return Some((s.len(), s.len())),
+        None => return None,
+    };
+    if b >= len {
+        return Some((start, len - lo));
+    }
+    let from = (b - 1 - lo).max(start.saturating_sub(1)).max(from);
+    match memchr::memchr(b'\n', &s[from..]) {
+        Some(i) => Some((start, (from + i + 1).max(start))),
+        None if lo + s.len() >= len => Some((start, len - lo)),
+        None => None,
+    }
 }
 
 /// The data lines of a file: everything after the header line.
@@ -1195,7 +1231,8 @@ fn main() {
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
     let lap = |what: &str| {
         if profile {
-            eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
+            let rss = std::fs::read_to_string("/proc/self/status").unwrap_or_default().lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("RssAnon") || l.starts_with("RssFile")).collect::<Vec<_>>().join(" ");
+            eprintln!("{:>8.3}s {what} {rss}", t0.elapsed().as_secs_f64());
         }
     };
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
@@ -1250,7 +1287,8 @@ fn main() {
     let event_bytes: usize = event_files.iter().map(|m| m.len()).sum();
     let click_bytes: usize = click_files.iter().map(|m| m.len()).sum();
     let ev_region = Region::new(event_bytes / 32 * std::mem::size_of::<Ev>() + Sink::<Ev>::slack(P) * threads);
-    let pe_region = Region::new(event_bytes / 32 * std::mem::size_of::<PEv>() + Sink::<PEv>::slack(Q) * threads);
+    let recycle_ev = std::env::var_os("SHOP_NORECYCLE").is_none();
+    let pe_region = Region::new(if recycle_ev { 0 } else { 1 } * event_bytes / 32 * std::mem::size_of::<PEv>() + Sink::<PEv>::slack(Q) * threads);
     let pc_region = Region::new(click_bytes / 24 * std::mem::size_of::<PCl>() + Sink::<PCl>::slack(Q) * threads);
     lap("setup");
 
@@ -1288,9 +1326,9 @@ fn main() {
                 if t < n_event_chunks {
                     let (fi, a, b) = event_chunks[t];
                     let slice: &[u8] = if pread_input {
-                        read_chunk(&event_fds[fi], a, b, &mut st.rbuf)
+                        read_chunk(&event_fds[fi], a, b, event_files[fi].len(), &mut st.rbuf)
                     } else {
-                        &event_files[fi][a..b]
+                        map_chunk(&event_files[fi], a, b)
                     };
                     let slice: &[u8] = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
                     let (idx, ev, tsc) = (&mut st.idx, &mut st.ev, &mut st.tsc);
@@ -1298,9 +1336,9 @@ fn main() {
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
                     let slice: &[u8] = if pread_input {
-                        read_chunk(&click_fds[fi], a, b, &mut st.rbuf)
+                        read_chunk(&click_fds[fi], a, b, click_files[fi].len(), &mut st.rbuf)
                     } else {
-                        &click_files[fi][a..b]
+                        map_chunk(&click_files[fi], a, b)
                     };
                     let slice: &[u8] = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
                     let aliases = aliases_cell.wait();
@@ -1310,10 +1348,10 @@ fn main() {
                 if release_input {
                     let slice = if t < n_event_chunks {
                         let (fi, a, b) = event_chunks[t];
-                        &event_files[fi][a..b]
+                        map_chunk(&event_files[fi], a, b)
                     } else {
                         let (fi, a, b) = click_chunks[t - n_event_chunks];
-                        &click_files[fi][a..b]
+                        map_chunk(&click_files[fi], a, b)
                     };
                     scan::release(slice);
                 }
@@ -1353,7 +1391,7 @@ fn main() {
         threads,
         P,
         || P2 {
-            pe: Sink::new(&pe_region, Q),
+            pe: Sink::new(if recycle_ev { &ev_region } else { &pe_region }, Q),
             seen: Vec::new(),
             coll: Vec::new(),
             dups: SmallIndex::new(1024),
@@ -1426,6 +1464,13 @@ fn main() {
             }
             for &(wi, j) in &dup_refs {
                 emit(&mut st.pe, p1[wi as usize].ev.get(t, j as usize));
+            }
+            if recycle_ev {
+                // Partition t's parsed events are dead: their warm, already
+                // faulted blocks take this phase's person-routed output.
+                for w in &p1 {
+                    ev_region.recycle(w.ev.blocks(t));
+                }
             }
             st.prof[1] += tt.elapsed().as_secs_f64();
         },

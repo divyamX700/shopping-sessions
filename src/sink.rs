@@ -21,6 +21,10 @@ pub struct Region {
     base: *mut u8,
     size: usize,
     next: AtomicUsize,
+    /// Blocks handed back with `recycle` (already faulted in, so reusing them
+    /// skips the kernel's page zeroing), taken before fresh ones.
+    free: std::sync::Mutex<Vec<usize>>,
+    nfree: AtomicUsize,
 }
 
 unsafe impl Send for Region {}
@@ -39,19 +43,33 @@ impl Region {
             let raw = map.as_mut_ptr();
             // Align the first block to BLOCK (mmap gives page alignment).
             let off = raw.align_offset(BLOCK).min(BLOCK);
-            Region { base: unsafe { raw.add(off) }, size: size - off, next: AtomicUsize::new(0), _map: map }
+            Region { base: unsafe { raw.add(off) }, size: size - off, next: AtomicUsize::new(0), free: Default::default(), nfree: AtomicUsize::new(0), _map: map }
         }
         #[cfg(not(unix))]
         {
             let mut buf: Vec<u8> = Vec::with_capacity(size + BLOCK);
             let raw = buf.as_mut_ptr();
             let off = raw.align_offset(BLOCK);
-            Region { base: unsafe { raw.add(off) }, size, next: AtomicUsize::new(0), _buf: buf }
+            Region { base: unsafe { raw.add(off) }, size, next: AtomicUsize::new(0), free: Default::default(), nfree: AtomicUsize::new(0), _buf: buf }
         }
+    }
+
+    /// Hand blocks (no longer read by anyone) back for reuse.
+    pub fn recycle(&self, blocks: impl Iterator<Item = *mut u8>) {
+        let mut f = self.free.lock().unwrap();
+        f.extend(blocks.map(|b| b as usize));
+        self.nfree.store(f.len(), Ordering::Relaxed);
     }
 
     #[inline]
     fn block(&self) -> *mut u8 {
+        if self.nfree.load(Ordering::Relaxed) > 0 {
+            let mut f = self.free.lock().unwrap();
+            if let Some(b) = f.pop() {
+                self.nfree.store(f.len(), Ordering::Relaxed);
+                return b as *mut u8;
+            }
+        }
         let off = self.next.fetch_add(BLOCK, Ordering::Relaxed);
         if off + BLOCK <= self.size {
             return unsafe { self.base.add(off) };
@@ -205,6 +223,11 @@ impl<'r, T: Copy + Default> Sink<'r, T> {
             Some(unsafe { std::slice::from_raw_parts(self.base[p] as *const T, cap - self.left[p]) })
         };
         full.chain(partial)
+    }
+
+    /// Every block of partition p (after `finish`), for `Region::recycle`.
+    pub fn blocks(&self, p: usize) -> impl Iterator<Item = *mut u8> + '_ {
+        self.full[p].iter().copied().chain((!self.base[p].is_null()).then_some(self.base[p])).map(|b| b as *mut u8)
     }
 
     /// Record j of partition p (after `finish`).
