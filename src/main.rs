@@ -1101,6 +1101,10 @@ fn main() {
         bench_parse(&ctx, &path);
         return;
     }
+    let release_input = std::env::var_os("SHOP_KEEPMAP").is_none();
+    if let Some(v) = std::env::var("SHOP_RA").ok().and_then(|v| v.parse().ok()) {
+        scan::READ_AHEAD.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
     let event_files = map_files(&list_csv(&data.join("events")));
     let click_files = map_files(&list_csv(&data.join("clicks")));
     let link_paths = list_csv(&data.join("links"));
@@ -1153,6 +1157,16 @@ fn main() {
                     let aliases = aliases_cell.wait();
                     let (idx, pc, tsc) = (&mut st.idx, &mut st.pc, &mut st.tsc);
                     if std::env::var_os("SHOP_OLDSCAN").is_some() { index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc)); } else { scan::lines::<4>(slice, |f| parse_click(f, &ctx, aliases, pc, tsc)); }
+                }
+                if release_input {
+                    let slice = if t < n_event_chunks {
+                        let (fi, a, b) = event_chunks[t];
+                        &event_files[fi][a..b]
+                    } else {
+                        let (fi, a, b) = click_chunks[t - n_event_chunks];
+                        &click_files[fi][a..b]
+                    };
+                    scan::release(slice);
                 }
                 st.prof[(t >= n_event_chunks) as usize] += tt.elapsed().as_secs_f64();
             },

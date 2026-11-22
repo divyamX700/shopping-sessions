@@ -98,8 +98,8 @@ jobs:
       - name: Where container time goes
         run: |
           N=$(nproc)
-          for flags in "--cpus $N --memory 14g --memory-swap 14g"; do
-          for k in 1 2; do
+          for k in 1 2 3; do
+          for flags in "--cpus $N" "--cpus $N -e SHOP_KEEPMAP=1" "--cpus $N -e SHOP_RA=0"; do
           out=$(mktemp -d); chmod 777 "$out"
           s=$(date +%s.%N)
           r=$(docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 $flags --user 1000:1000             -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$N" -e SHOP_PROFILE=1 cur 2>&1 | grep -E "epoch main (end|start)" | tail -1 | awk '{print $4}' || true)

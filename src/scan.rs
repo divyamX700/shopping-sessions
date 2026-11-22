@@ -10,8 +10,20 @@
 
 use crate::csv::{masks, split};
 
+/// Prefetch input this far ahead of the block being classified: mapped input
+/// comes in 4 KB pages, and hardware prefetchers stop at page ends.
+pub static READ_AHEAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
+
 #[inline(always)]
 fn block<const W: bool>(data: &[u8], at: usize) -> (u64, u64, u64) {
+    let ra = READ_AHEAD.load(std::sync::atomic::Ordering::Relaxed);
+    if ra != 0 && at + ra < data.len() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(data.as_ptr().add(at + ra) as *const i8, _MM_HINT_T0);
+        }
+    }
     if at + 64 <= data.len() {
         if W {
             #[cfg(target_arch = "x86_64")]
@@ -317,4 +329,22 @@ mod tests {
         big.truncate(big.len() - 1);
         check::<7>(&big);
     }
+}
+
+/// Drop the mapped pages that lie wholly inside `s` (MADV_DONTNEED), so the
+/// unmapping happens now on this thread instead of at exit on one thread.
+pub fn release(s: &[u8]) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        }
+        let from = (s.as_ptr() as usize + 4095) & !4095;
+        let to = (s.as_ptr() as usize + s.len()) & !4095;
+        if to > from {
+            madvise(from as *mut u8, to - from, 4);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = s;
 }
