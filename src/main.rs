@@ -58,6 +58,8 @@ const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
 /// Dedup bitmap bits per event (false-positive rate ~1/DEDUP_BITS).
 const DEDUP_BITS: usize = env_num(option_env!("SHOP_DEDUP_BITS"), 16);
+/// Prefetch distance for alias-table lookups.
+const AHEAD: usize = env_num(option_env!("SHOP_AHEAD"), 16);
 const CHUNK: usize = env_num(option_env!("SHOP_CHUNK_KB"), 512) << 10;
 const EMPTY: u64 = u64::MAX;
 /// `ip` = ingest seconds (biased, 40 bits) << 24 | price (24 bits).
@@ -557,7 +559,7 @@ fn parse_click_raw(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<PCl>) {
 /// Resolve a chunk's clicks to persons (prefetching 16 ahead) and route them.
 fn route_clicks(pend: &[PCl], aliases: &Aliases, out: &mut Sink<PCl>) {
     for i in 0..pend.len() {
-        if let Some(a) = pend.get(i + 16) {
+        if let Some(a) = pend.get(i + AHEAD) {
             aliases.prefetch(mix(a.person));
         }
         let mut c = pend[i];
@@ -1772,7 +1774,7 @@ fn main() {
                 let mut j = 0usize;
                 for sl in w.ev.slices(t) {
                 for (k, e) in sl.iter().enumerate() {
-                    if let Some(a) = sl.get(k + 16) {
+                    if let Some(a) = sl.get(k + AHEAD) {
                         if !filt_emit { aliases.prefetch(mix(a.ukey)); }
                     }
                     let j0 = j;
