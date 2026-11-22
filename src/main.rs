@@ -1403,6 +1403,8 @@ fn main() {
             st.persons.clear();
             st.eidx.clear();
             st.eoff.clear();
+            st.ra.clear();
+            st.ra.reserve(ne);
             for w in &p2 {
                 for e in w.pe.slices(q).flatten() {
                     let (i, new) = st.index.get_or_insert(e.person, st.persons.len() as u32);
@@ -1411,7 +1413,7 @@ fn main() {
                         st.eoff.push(0);
                     }
                     st.eoff[i as usize] += 1;
-                    st.eidx.push(i);
+                    st.ra.push((e.w, i));
                 }
             }
             let np = st.persons.len();
@@ -1425,16 +1427,6 @@ fn main() {
             st.eoff.push(run);
             // Time order first (radix), then a stable scatter by person:
             // every person's events end up sorted without per-person sorts.
-            st.ra.clear();
-            {
-                let mut k = 0;
-                for w in &p2 {
-                    for e in w.pe.slices(q).flatten() {
-                        st.ra.push((e.w, st.eidx[k]));
-                        k += 1;
-                    }
-                }
-            }
             radix_ts(&mut st.ra, &mut st.rb);
             st.evs.clear();
             st.evs.resize(ne, 0);

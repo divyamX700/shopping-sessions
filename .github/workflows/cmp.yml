@@ -33,5 +33,6 @@ jobs:
           L=$(find /tmp/larp/native/target/release -maxdepth 1 -type f -executable | head -1)
           for r in 1 2 3; do
             o=$(mktemp -d); s=$(date +%s.%N); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) $L 2>&1 | tail -1; e=$(date +%s.%N); echo "larp wall $(python3 -c "print(round($e-$s,3))")"
+            o=$(mktemp -d); s=$(date +%s.%N); SS_MAP=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) $L 2>&1 | tail -1; e=$(date +%s.%N); echo "larp SS_MAP=1 wall $(python3 -c "print(round($e-$s,3))")"
             o=$(mktemp -d); s=$(date +%s.%N); env ${{ github.event.inputs.env }} SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "s (setup|parse|dedup|sessions|write)$|cpu" | tr '\n' ' '; e=$(date +%s.%N); echo; echo "ours wall $(python3 -c "print(round($e-$s,3))")"
           done
