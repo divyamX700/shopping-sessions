@@ -96,10 +96,11 @@ jobs:
 
       - name: Where container time goes
         run: |
-          for k in 1 2; do
+          for k in "-e X=1" "-e FAST_READ=1" "-e X=1" "-e FAST_READ=1"; do
+          echo "== $k"
           out=$(mktemp -d); chmod 777 "$out"
           s=$(date +%s.%N)
-          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cpus "$(nproc)" --memory 14g --user 1000:1000             -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$(nproc)" -e SHOP_PROFILE=1 cur 2>&1 | grep -E "fast done|epoch|Rss|AnonHuge"
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cpus "$(nproc)" --memory 14g --user 1000:1000             -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$(nproc)" -e SHOP_PROFILE=1 $k cur 2>&1 | grep -E "inputs|fast: parse|fast done|epoch|Rss|AnonHuge"
           e=$(date +%s.%N); echo "docker start $s end $e wall $(python3 -c "print(round($e-$s,3))")"
           done
           s=$(date +%s.%N); docker run --rm --network none --entrypoint /shopping -e DATA_DIR=/nonexistent cur >/dev/null 2>&1 || true; e=$(date +%s.%N); echo "empty container run $(python3 -c "print(round($e-$s,3))")"

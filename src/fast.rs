@@ -21,7 +21,7 @@ use std::time::Instant;
 use memmap2::Mmap;
 
 use crate::sink::{Region, Sink};
-use crate::{body, chunks, csv, index, list_csv, map_files, out, pool_finish, scan, ts, Ctx};
+use crate::{body, csv, index, list_csv, map_files, out, pool_finish, scan, ts, Ctx};
 
 const M40: u64 = (1 << 40) - 1;
 const MA: u64 = 0x9E37_79B9_7F4B;
@@ -647,7 +647,7 @@ fn populate(s: &[u8]) {
     let _ = s;
 }
 
-fn sample_body(m: &Mmap, max: usize) -> &[u8] {
+fn sample_body(m: &[u8], max: usize) -> &[u8] {
     let b = body(m);
     if b.len() <= max {
         return b;
@@ -656,6 +656,97 @@ fn sample_body(m: &Mmap, max: usize) -> &[u8] {
         Some(i) => &b[..i + 1],
         None => b,
     }
+}
+
+/// Newline-aligned (file, start, end) ranges of every file body.
+fn chunks_s(maps: &[&[u8]]) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    for (fi, m) in maps.iter().enumerate() {
+        let len = m.len();
+        let mut pos = len - body(m).len();
+        while pos < len {
+            let mut end = (pos + (2 << 20)).min(len);
+            if end < len {
+                end = match memchr::memchr(b'\n', &m[end..]) {
+                    Some(i) => end + i + 1,
+                    None => len,
+                };
+            }
+            out.push((fi, pos, end));
+            pos = end;
+        }
+    }
+    out
+}
+
+/// Every input file's bytes: mapped, or (FAST_READ) read in parallel into
+/// one huge-page buffer, which is cheaper to tear down at exit.
+fn load_inputs(dirs: &[&Path], threads: usize) -> Vec<Vec<&'static [u8]>> {
+    let lists: Vec<Vec<std::path::PathBuf>> = dirs.iter().map(|d| list_csv(d)).collect();
+    if std::env::var_os("FAST_READ").is_none() {
+        return lists
+            .iter()
+            .map(|l| {
+                let maps: &'static Vec<Mmap> = Box::leak(Box::new(map_files(l)));
+                maps.iter().map(|m| &m[..]).collect()
+            })
+            .collect();
+    }
+    let mut files: Vec<(usize, std::path::PathBuf, usize)> = Vec::new();
+    for (k, l) in lists.iter().enumerate() {
+        for p in l {
+            let n = std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0);
+            if n > 0 {
+                files.push((k, p.clone(), n));
+            }
+        }
+    }
+    let total: usize = files.iter().map(|f| f.2.next_multiple_of(64) + 64).sum();
+    let mut region = memmap2::MmapMut::map_anon(total.max(64)).expect("input buffer");
+    #[cfg(target_os = "linux")]
+    let _ = region.advise(memmap2::Advice::HugePage);
+    let base = region.as_mut_ptr() as usize;
+    std::mem::forget(region);
+    let mut offs = Vec::new();
+    let mut at = 0usize;
+    for f in &files {
+        offs.push(at);
+        at += f.2.next_multiple_of(64) + 64;
+    }
+    const PIECE: usize = 8 << 20;
+    let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let mut a = 0;
+        while a < f.2 {
+            let z = (a + PIECE).min(f.2);
+            pieces.push((i, a, z));
+            a = z;
+        }
+    }
+    pieces.sort_by_key(|p| std::cmp::Reverse(p.2 - p.1));
+    let next = AtomicUsize::new(0);
+    thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                use std::os::unix::fs::FileExt;
+                let mut open: Option<(usize, std::fs::File)> = None;
+                loop {
+                    let t = next.fetch_add(1, Relaxed);
+                    let Some(&(i, a, z)) = pieces.get(t) else { break };
+                    if open.as_ref().map(|o| o.0) != Some(i) {
+                        open = Some((i, std::fs::File::open(&files[i].1).expect("open input")));
+                    }
+                    let dst = unsafe { std::slice::from_raw_parts_mut((base + offs[i] + a) as *mut u8, z - a) };
+                    open.as_ref().unwrap().1.read_exact_at(dst, a as u64).expect("read input");
+                }
+            });
+        }
+    });
+    let mut out: Vec<Vec<&'static [u8]>> = vec![Vec::new(); dirs.len()];
+    for (i, f) in files.iter().enumerate() {
+        out[f.0].push(unsafe { std::slice::from_raw_parts((base + offs[i]) as *const u8, f.2) });
+    }
+    out
 }
 
 pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool) -> bool {
@@ -668,9 +759,12 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     if ctx.cat_names.len() > 32 || ctx.camp_ids.len() >= 4095 || ctx.we - ctx.ws > 24 * DAYMS {
         return false;
     }
-    let event_files = map_files(&list_csv(&data.join("events")));
-    let click_files = map_files(&list_csv(&data.join("clicks")));
-    let link_files = map_files(&list_csv(&data.join("links")));
+    let (ed, cd, ld) = (data.join("events"), data.join("clicks"), data.join("links"));
+    let mut inputs = load_inputs(&[&ed, &cd, &ld], threads).into_iter();
+    let event_files = inputs.next().unwrap();
+    let click_files = inputs.next().unwrap();
+    let link_files = inputs.next().unwrap();
+    lap("inputs");
     if event_files.is_empty() || link_files.is_empty() {
         return false;
     }
@@ -680,7 +774,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     // User key from link pairs: one person's IDs differ only in the low 9 bits.
     let mut lpairs = Vec::new();
     let mut lids = Vec::new();
-    'outer: for m in &link_files {
+    'outer: for &m in &link_files {
         csv::scan::<2>(sample_body(m, 1 << 20), |f| {
             if lpairs.len() >= 3000 {
                 return;
@@ -706,7 +800,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
 
     // Event key: events of one person have consecutive counters in time order.
     let big = (0..event_files.len()).max_by_key(|&i| event_files[i].len()).unwrap();
-    let sample = sample_body(&event_files[big], 6 << 20);
+    let sample = sample_body(event_files[big], 6 << 20);
     let mut rows: Vec<(u64, i64, u64)> = Vec::new();
     let mut tsc = ts::DateCache::new();
     let mut sample_lines = 0usize;
@@ -762,9 +856,9 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     let click_bytes: usize = click_files.iter().map(|m| m.len()).sum();
     let ev_region = Region::new(event_bytes / 40 * 16 + Sink::<ERec>::slack(n_eb) * threads);
     let cl_region = Region::new(click_bytes / 28 * 16 + Sink::<CRec>::slack(n_cb) * threads);
-    let ec = chunks(&event_files);
-    let cc = chunks(&click_files);
-    let lc = chunks(&link_files);
+    let ec = chunks_s(&event_files);
+    let cc = chunks_s(&click_files);
+    let lc = chunks_s(&link_files);
     let (n_lc, n_cc) = (lc.len(), cc.len());
     lap("setup");
 
