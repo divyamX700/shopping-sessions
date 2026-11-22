@@ -1,0 +1,32 @@
+name: prof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          nproc; lscpu | grep "Model name"
+          sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -q linux-tools-azure >/dev/null 2>&1 || true
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -q
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" | tail -1
+      - name: Phases
+        run: |
+          for i in 1 2; do SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast|cpu|general"; done
+          for m in 2 1; do FAST_SCANONLY=$m SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 30 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done
+      - name: Perf
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null
+          DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) perf record -F 4999 -g -o perf.data ./target/release/shopping 2>&1 | tail -2
+          perf report -i perf.data --stdio --no-children --sort symbol --percent-limit 0.7 2>/dev/null | grep -E "^ +[0-9]" | head -45
+          echo "---- by srcline (top)"
+          perf report -i perf.data --stdio --no-children --sort srcline --percent-limit 0.8 2>/dev/null | grep -E "^ +[0-9]" | head -50
