@@ -467,51 +467,50 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, aliases: &Aliases, out: &mut Sink<PCl>
 /// Every linked ID that is not its person's name -> the name. A bitmap in
 /// front of the table answers most lookups (IDs that are names) from cache.
 struct Aliases {
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+    /// (ID key, person key) pairs: a lookup touches one cache line. On huge
+    /// pages, so the random probes do not also miss the TLB.
+    slots: &'static mut [[u64; 2]],
     mask: usize,
-    filter: Vec<u64>,
-    fmask: u64,
+}
+
+/// A zero-filled array on transparent huge pages (leaked: freed at exit).
+fn huge_slice<T: Copy>(n: usize) -> &'static mut [T] {
+    let bytes = (n * std::mem::size_of::<T>()).max(4096);
+    let mut m = memmap2::MmapMut::map_anon(bytes).expect("huge alloc");
+    #[cfg(target_os = "linux")]
+    let _ = m.advise(memmap2::Advice::HugePage);
+    let p = m.as_mut_ptr() as *mut T;
+    std::mem::forget(m);
+    unsafe { std::slice::from_raw_parts_mut(p, n) }
 }
 
 impl Aliases {
     fn from_pairs(pairs: &[(u64, u64)]) -> Self {
-        let cap = (pairs.len() * 2).next_power_of_two().max(16);
-        let fbits = (pairs.len() * 16).next_power_of_two().max(1 << 12);
-        let mut m = Aliases {
-            keys: vec![EMPTY; cap],
-            vals: vec![0; cap],
-            mask: cap - 1,
-            filter: vec![0; fbits / 64],
-            fmask: fbits as u64 - 1,
-        };
-        for &(k, v) in pairs {
-            let h = mix(k);
-            let f = h & m.fmask;
-            m.filter[(f >> 6) as usize] |= 1 << (f & 63);
-            let mut s = h as usize & m.mask;
-            while m.keys[s] != EMPTY && m.keys[s] != k {
-                s = (s + 1) & m.mask;
-            }
-            m.keys[s] = k;
-            m.vals[s] = v;
+        let cap = (pairs.len() * 3).next_power_of_two().max(16);
+        let slots = huge_slice::<[u64; 2]>(cap);
+        for s in slots.iter_mut() {
+            s[0] = EMPTY;
         }
-        m
+        let mask = cap - 1;
+        for &(k, v) in pairs {
+            let mut s = mix(k) as usize & mask;
+            while slots[s][0] != EMPTY && slots[s][0] != k {
+                s = (s + 1) & mask;
+            }
+            slots[s] = [k, v];
+        }
+        Aliases { slots, mask }
     }
     /// `h` is mix(k).
     #[inline(always)]
     fn person(&self, k: u64, h: u64) -> u64 {
-        let f = h & self.fmask;
-        if self.filter[(f >> 6) as usize] & (1 << (f & 63)) == 0 {
-            return k;
-        }
         let mut s = h as usize & self.mask;
         loop {
-            let x = self.keys[s];
-            if x == k {
-                return self.vals[s];
+            let e = unsafe { self.slots.get_unchecked(s) };
+            if e[0] == k {
+                return e[1];
             }
-            if x == EMPTY {
+            if e[0] == EMPTY {
                 return k;
             }
             s = (s + 1) & self.mask;
@@ -519,9 +518,7 @@ impl Aliases {
     }
     #[inline(always)]
     fn prefetch(&self, h: u64) {
-        let f = h & self.fmask;
-        prefetch(self.filter.as_ptr().wrapping_add((f >> 6) as usize));
-        prefetch(self.keys.as_ptr().wrapping_add(h as usize & self.mask));
+        prefetch(unsafe { self.slots.as_ptr().add(h as usize & self.mask) });
     }
 }
 
@@ -1249,7 +1246,15 @@ fn main() {
             };
             let mut dup_refs: Vec<(u32, u32)> = Vec::new();
             for (wi, w) in p1.iter().enumerate() {
-                for (j, e) in w.ev.slices(t).flatten().enumerate() {
+                let mut j = 0usize;
+                for sl in w.ev.slices(t) {
+                for (k, e) in sl.iter().enumerate() {
+                    if let Some(a) = sl.get(k + 16) {
+                        aliases.prefetch(mix(a.ukey));
+                    }
+                    let j0 = j;
+                    j += 1;
+                    let j = j0;
                     let f = mix(e.ekey) & fmask;
                     if st.coll[(f >> 6) as usize] & (1u64 << (f & 63)) == 0 {
                         emit(&mut st.pe, e);
@@ -1264,6 +1269,7 @@ fn main() {
                             }
                         }
                     }
+                }
                 }
             }
             for &(wi, j) in &dup_refs {
