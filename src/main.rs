@@ -53,7 +53,7 @@ const fn env_num(s: Option<&str>, d: usize) -> usize {
 }
 const P_BITS: u32 = env_num(option_env!("SHOP_P_BITS"), 9) as u32;
 const P: usize = 1 << P_BITS;
-const Q_BITS: u32 = env_num(option_env!("SHOP_Q_BITS"), 7) as u32;
+const Q_BITS: u32 = env_num(option_env!("SHOP_Q_BITS"), 10) as u32;
 const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
 const CHUNK: usize = env_num(option_env!("SHOP_CHUNK_KB"), 2048) << 10;
