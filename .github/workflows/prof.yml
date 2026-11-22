@@ -22,7 +22,8 @@ jobs:
       - name: Phases
         run: |
           for i in 1 2; do SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast|cpu|general"; done
-          for m in 2 1; do FAST_SCANONLY=$m SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 30 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done
+          for m in 2 1; do echo "scanonly $m"; FAST_SCANONLY=$m SHOP_PROFILE=1 SHOP_NOFAST=0 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 30 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done
+          for k in 8 1 2 4 3 6 7; do echo "FAST_K=$k"; FAST_K=$k SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 40 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done
       - name: Perf
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null

@@ -889,6 +889,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         }
     }
     let scan_only = std::env::var_os("FAST_SCANONLY").is_some();
+    let km: u32 = std::env::var("FAST_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let tp = Tsp::new(ctx.ws, ctx.we);
     let tid_next = AtomicUsize::new(0);
     let p1: Vec<P1> = thread::scope(|scope| {
@@ -1010,9 +1011,14 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     if f[0].is_empty() {
                         return;
                     }
-                    let Some(ing) = tp.parse(f[3]) else {
-                        sh.abort.store(true, Relaxed);
-                        return;
+                    let ing = if km & 2 != 0 {
+                        ws + 1000 * (f[3].len() as i64 + 100)
+                    } else {
+                        let Some(ing) = tp.parse(f[3]) else {
+                            sh.abort.store(true, Relaxed);
+                            return;
+                        };
+                        ing
                     };
                     let ing_rel = ing.div_euclid(1000) - sh.ing_base;
                     if ing_rel <= 0 || ing_rel >= 1 << 22 || ing % 1000 != 0 {
@@ -1026,7 +1032,12 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                         if f[1].is_empty() || f[5].is_empty() {
                             break 'v;
                         }
-                        let Some(t) = tp.parse(f[2]) else { break 'v };
+                        let t = if km & 2 != 0 {
+                            ws + f[2].len() as i64
+                        } else {
+                            let Some(t) = tp.parse(f[2]) else { break 'v };
+                            t
+                        };
                         if t < ws || t >= we || ing - t > DAYMS {
                             break 'v;
                         }
@@ -1053,7 +1064,9 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     }
                     let valid = (lo >> 31) & 3 != T_INVALID;
                     let mut user = 0u64;
-                    if valid {
+                    if valid && km & 4 != 0 {
+                        user = f[1].len() as u64;
+                    } else if valid {
                         match sh.user_at(f[1], end) {
                             Some((p, a)) if a < 8 => user = (p as u64) << 3 | a as u64,
                             u => {
@@ -1064,16 +1077,22 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                             }
                         }
                     }
-                    let slot = if f[0].len() > 1 && f[0][0] == b'e' {
+                    let slot = if km & 4 != 0 {
+                        Some(f[0].len() * 4099 % sh.n_slots)
+                    } else if f[0].len() > 1 && f[0][0] == b'e' {
                         scan::b36(&f[0][1..], scan::load8(&f[0][1..], end)).map(|o| dec(unx(o, sh.binv), ek_, sh.ainv) as usize).filter(|&v| v < sh.n_slots)
                     } else {
                         None
                     };
                     match slot {
-                        Some(v) => st.ev.push(
-                            v >> EB,
-                            ERec { lo, hi: (v as u64 & 0xFFFF) | (ing_rel as u64) << 16 | user << 38 },
-                        ),
+                        Some(v) => {
+                            let r = ERec { lo, hi: (v as u64 & 0xFFFF) | (ing_rel as u64) << 16 | user << 38 };
+                            if km & 1 != 0 {
+                                st.cpu[0] += std::hint::black_box(r.lo ^ r.hi) as f64 * 0.0;
+                            } else {
+                                st.ev.push(v >> EB, r);
+                            }
+                        }
                         None => {
                             st.odd.push(OddEv {
                                 eid: f[0].to_vec(),
@@ -1100,8 +1119,8 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         let c: Vec<f64> = (0..3).map(|i| p1.iter().map(|s| s.cpu[i]).sum()).collect();
         eprintln!("parse cpu: links {:.3} clicks {:.3} events {:.3}", c[0], c[1], c[2]);
     }
-    if scan_only {
-        return false;
+    if scan_only || km != 0 {
+        std::process::exit(0);
     }
     if sh.abort.load(Relaxed) {
         return false;
