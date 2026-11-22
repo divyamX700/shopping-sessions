@@ -12,6 +12,6 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
 
 FROM scratch
 COPY --from=build /shopping /shopping
-ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8
+ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8 MIMALLOC_ALLOW_LARGE_OS_PAGES=1
 USER 1000:1000
 CMD ["/shopping"]

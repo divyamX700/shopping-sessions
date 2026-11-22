@@ -1015,11 +1015,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     let mut p1 = p1;
     p1.sort_by_key(|s| s.tid);
 
-    // ------------------------------------------------ pass 2: dedup, click grouping
-    let dense_map = memmap2::MmapMut::map_anon(n_slots * 16).expect("dense");
-    #[cfg(target_os = "linux")]
-    let _ = dense_map.advise(memmap2::Advice::HugePage);
-    let dense = dense_map.as_ptr() as *mut ERec as usize;
+    // ------------------------------------------------ pass 2: clicks grouped by person
     let mut cb_base = vec![0usize; n_cb + 1];
     for b in 0..n_cb {
         cb_base[b + 1] = cb_base[b] + p1.iter().map(|s| s.cl.len(b)).sum::<usize>();
@@ -1038,72 +1034,57 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     }
     let p2: Vec<P2> = pool_finish(
         threads,
-        n_eb + n_cb,
+        n_cb,
         || P2 { xcl: Vec::new(), cnt: vec![0; 1 << CB] },
-        |st, t| {
-            if t < n_eb {
-                let base = unsafe { (dense as *mut ERec).add(t << EB) };
-                for s in &p1 {
-                    for sl in s.ev.slices(t) {
-                        for r in sl {
-                            let at = unsafe { &mut *base.add((r.hi & 0xFFFF) as usize) };
-                            if at.hi == 0 || (r.hi >> 16) & 0x3F_FFFF < (at.hi >> 16) & 0x3F_FFFF {
-                                *at = *r;
-                            }
-                        }
+        |st, b| {
+            let pbase = b << CB;
+            st.cnt.iter_mut().for_each(|c| *c = 0);
+            for s in &p1 {
+                for sl in s.cl.slices(b) {
+                    for r in sl {
+                        let p = (r.hi >> 34) as usize;
+                        st.cnt[p - pbase] += 1;
                     }
                 }
-            } else {
-                let b = t - n_eb;
-                let pbase = b << CB;
-                st.cnt.iter_mut().for_each(|c| *c = 0);
-                for s in &p1 {
-                    for sl in s.cl.slices(b) {
-                        for r in sl {
-                            let p = (r.hi >> 34) as usize;
-                            st.cnt[p - pbase] += 1;
-                        }
+            }
+            let mut acc = cb_base[b] as u32;
+            for i in 0..(1usize << CB) {
+                let c = st.cnt[i];
+                st.cnt[i] = acc;
+                if pbase + i < p_cap {
+                    off[pbase + i].store(acc, Relaxed);
+                }
+                acc += c;
+            }
+            if b == n_cb - 1 {
+                off[p_cap].store(acc, Relaxed);
+            }
+            let dst = cs_ptr as *mut CRec;
+            for s in &p1 {
+                for sl in s.cl.slices(b) {
+                    for r in sl {
+                        let p = (r.hi >> 34) as usize;
+                        let i = &mut st.cnt[p - pbase];
+                        unsafe { *dst.add(*i as usize) = *r };
+                        *i += 1;
                     }
                 }
-                let mut acc = cb_base[b] as u32;
-                for i in 0..(1usize << CB) {
-                    let c = st.cnt[i];
-                    st.cnt[i] = acc;
-                    if pbase + i < p_cap {
-                        off[pbase + i].store(acc, Relaxed);
-                    }
-                    acc += c;
-                }
-                if b == n_cb - 1 {
-                    off[p_cap].store(acc, Relaxed);
-                }
-                let dst = cs_ptr as *mut CRec;
-                for s in &p1 {
-                    for sl in s.cl.slices(b) {
-                        for r in sl {
-                            let p = (r.hi >> 34) as usize;
-                            let i = &mut st.cnt[p - pbase];
-                            unsafe { *dst.add(*i as usize) = *r };
-                            *i += 1;
-                        }
-                    }
-                }
-                // Clicks of complex persons go to the general path.
-                for i in 0..(1usize << CB).min(p_cap.saturating_sub(pbase)) {
-                    let p = pbase + i;
-                    if sh.pstate[p].load(Relaxed) & COMPLEX != 0 {
-                        let (a, z) = (off[p].load(Relaxed) as usize, st.cnt[i] as usize);
-                        for j in a..z {
-                            let r = unsafe { *dst.add(j) };
-                            st.xcl.push((r.lo, r.hi));
-                        }
+            }
+            // Clicks of complex persons go to the general path.
+            for i in 0..(1usize << CB).min(p_cap.saturating_sub(pbase)) {
+                let p = pbase + i;
+                if sh.pstate[p].load(Relaxed) & COMPLEX != 0 {
+                    let (a, z) = (off[p].load(Relaxed) as usize, st.cnt[i] as usize);
+                    for j in a..z {
+                        let r = unsafe { *dst.add(j) };
+                        st.xcl.push((r.lo, r.hi));
                     }
                 }
             }
         },
         |_, _| {},
     );
-    lap("dedup");
+    lap("clicks");
 
     // Odd event IDs: dedup by string; attach to their person's run.
     let mut gen_ev: Vec<XEv> = Vec::new();
@@ -1134,89 +1115,125 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         }
     }
 
-    // ------------------------------------------------ pass 3: persons in slot order
-    let dense_s: &[ERec] = unsafe { std::slice::from_raw_parts(dense as *const ERec, n_slots) };
-    let n_seg = threads * 16;
-    let seg_len = n_slots.div_ceil(n_seg);
+    // ------------------------------------------------ pass 3: per slot range, dedup then persons
+    // Each range is deduped in a thread-local array (it fits in L2) and walked
+    // in slot order. Runs that end inside the range are finished at once; the
+    // first and last run may continue into the neighbouring ranges, so they
+    // are kept and stitched afterwards.
+    struct Run {
+        p: u32,
+        ev: Vec<Ev>,
+    }
+    struct Edge {
+        b: usize,
+        head: Run,
+        tail: Option<Run>,
+    }
     struct P3 {
         agg: Agg,
         xev: Vec<XEv>,
-        bounds: Vec<(usize, u32, u32)>,
+        edges: Vec<Edge>,
+        local: Vec<ERec>,
     }
     let mut p3: Vec<P3> = pool_finish(
         threads,
-        n_seg,
-        || P3 { agg: Agg::new(ctx), xev: Vec::new(), bounds: Vec::new() },
-        |st, k| {
-            let (s0, s1) = (k * seg_len, ((k + 1) * seg_len).min(n_slots));
-            let mut skip_p = NONE;
-            let mut j = s0;
-            while j > 0 {
-                j -= 1;
-                let r = dense_s[j];
-                if r.hi != 0 && (r.lo >> 31) & 3 != T_INVALID && (r.hi >> 38) & ESC == 0 {
-                    skip_p = (r.hi >> 41) as u32;
-                    break;
+        n_eb,
+        || P3 { agg: Agg::new(ctx), xev: Vec::new(), edges: Vec::new(), local: vec![ERec::default(); 1 << EB] },
+        |st, b| {
+            let mut local = std::mem::take(&mut st.local);
+            local.fill(ERec::default());
+            for s in &p1 {
+                for sl in s.ev.slices(b) {
+                    for r in sl {
+                        let at = unsafe { local.get_unchecked_mut((r.hi & 0xFFFF) as usize) };
+                        if at.hi == 0 || (r.hi >> 16) & 0x3F_FFFF < (at.hi >> 16) & 0x3F_FFFF {
+                            *at = *r;
+                        }
+                    }
                 }
             }
-            let mut skipping = skip_p != NONE;
             let mut cur = NONE;
-            let mut first = NONE;
+            let mut head: Option<Run> = None;
             let mut buf: Vec<Ev> = Vec::new();
-            let mut s = s0;
-            loop {
-                if s >= n_slots || (s >= s1 && (skipping || cur == NONE)) {
-                    break;
-                }
-                let r = dense_s[s];
+            for r in local.iter() {
                 if r.hi == 0 || (r.lo >> 31) & 3 == T_INVALID {
-                    s += 1;
                     continue;
                 }
                 let user = r.hi >> 38;
                 if user & ESC != 0 {
-                    if s < s1 {
-                        st.xev.push(XEv { key: REF | (user & (ESC - 1)), ts: r.lo as u32 & 0x7FFF_FFFF, pay: (r.lo >> 31) as u32 });
-                    }
-                    s += 1;
+                    st.xev.push(XEv { key: REF | (user & (ESC - 1)), ts: r.lo as u32 & 0x7FFF_FFFF, pay: (r.lo >> 31) as u32 });
                     continue;
                 }
                 let p = (user >> 3) as u32;
-                if skipping {
-                    if p == skip_p {
-                        s += 1;
-                        continue;
-                    }
-                    skipping = false;
-                    if p < skip_p {
-                        sh.abort.store(true, Relaxed);
-                    }
-                }
                 if p != cur {
-                    if s >= s1 {
-                        break;
-                    }
                     if cur != NONE {
                         if p < cur {
                             sh.abort.store(true, Relaxed);
                         }
-                        finish_run(ctx, &sh, &click_sorted, &off, &odd_map, cur as usize, &mut buf, st);
-                    } else {
-                        first = p;
+                        if head.is_none() {
+                            head = Some(Run { p: cur, ev: std::mem::take(&mut buf) });
+                        } else {
+                            finish_run(ctx, &sh, &click_sorted, &off, &odd_map, cur as usize, &mut buf, &mut st.agg, &mut st.xev);
+                        }
                     }
                     cur = p;
                     buf.clear();
                 }
                 buf.push(Ev { ts: r.lo as u32 & 0x7FFF_FFFF, pay: (r.lo >> 31) as u32, alias: (user & 7) as u8 });
-                s += 1;
             }
             if cur != NONE {
-                finish_run(ctx, &sh, &click_sorted, &off, &odd_map, cur as usize, &mut buf, st);
-                st.bounds.push((k, first, cur));
+                let last = Run { p: cur, ev: buf };
+                match head {
+                    None => st.edges.push(Edge { b, head: last, tail: None }),
+                    Some(h) => st.edges.push(Edge { b, head: h, tail: Some(last) }),
+                }
             }
+            st.local = local;
         },
         |_, _| {},
     );
+    // Stitch the runs that cross range boundaries.
+    let mut edges: Vec<Edge> = p3.iter_mut().flat_map(|s| s.edges.drain(..)).collect();
+    edges.sort_unstable_by_key(|e| e.b);
+    let mut done: Vec<Run> = Vec::new();
+    let mut open: Option<Run> = None;
+    for e in edges {
+        let h = e.head;
+        open = match open {
+            Some(mut o) if o.p == h.p => {
+                o.ev.extend_from_slice(&h.ev);
+                Some(o)
+            }
+            Some(o) => {
+                if h.p < o.p {
+                    return false;
+                }
+                done.push(o);
+                Some(h)
+            }
+            None => Some(h),
+        };
+        if let Some(t) = e.tail {
+            done.push(open.take().unwrap());
+            open = Some(t);
+        }
+    }
+    if let Some(o) = open {
+        done.push(o);
+    }
+    let done: Vec<std::sync::Mutex<Run>> = done.into_iter().map(std::sync::Mutex::new).collect();
+    let p3b: Vec<P3> = pool_finish(
+        threads,
+        done.len(),
+        || P3 { agg: Agg::new(ctx), xev: Vec::new(), edges: Vec::new(), local: Vec::new() },
+        |st, k| {
+            let mut r = done[k].lock().unwrap();
+            let p = r.p as usize;
+            finish_run(ctx, &sh, &click_sorted, &off, &odd_map, p, &mut r.ev, &mut st.agg, &mut st.xev);
+        },
+        |_, _| {},
+    );
+    p3.extend(p3b);
 
     #[allow(clippy::too_many_arguments)]
     fn finish_run(
@@ -1227,7 +1244,8 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         odd_map: &HashMap<usize, Vec<Ev>>,
         p: usize,
         buf: &mut Vec<Ev>,
-        st: &mut P3,
+        agg: &mut Agg,
+        xev: &mut Vec<XEv>,
     ) {
         let state = sh.pstate[p].load(Relaxed);
         if state & ODD != 0 {
@@ -1239,7 +1257,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         }
         if state & COMPLEX != 0 {
             for e in buf.iter() {
-                st.xev.push(XEv { key: (p as u64) << 9 | e.alias as u64, ts: e.ts, pay: e.pay });
+                xev.push(XEv { key: (p as u64) << 9 | e.alias as u64, ts: e.ts, pay: e.pay });
             }
             return;
         }
@@ -1252,7 +1270,6 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                 a
             }
         };
-        let agg = &mut st.agg;
         let (ca, cz) = (off[p].load(Relaxed) as usize, off[p + 1].load(Relaxed) as usize);
         agg.cl.clear();
         for r in &cs[ca..cz] {
@@ -1275,7 +1292,6 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
             // Name: smallest ID of the component (or the lone ID).
             agg.name.clear();
             if kk >= 16 {
-                let root = kk - 16;
                 for a in 0..16u32 {
                     if present >> a & 1 != 0 && key(a) == kk {
                         agg.tmp.clear();
@@ -1285,7 +1301,6 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                         }
                     }
                 }
-                let _ = root;
             } else {
                 sh.uname(p, kk, &mut agg.name);
             }
@@ -1295,11 +1310,6 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         }
     }
     if sh.abort.load(Relaxed) {
-        return false;
-    }
-    let mut bounds: Vec<(usize, u32, u32)> = p3.iter().flat_map(|s| s.bounds.iter().copied()).collect();
-    bounds.sort_unstable();
-    if bounds.windows(2).any(|w| w[1].1 <= w[0].2) {
         return false;
     }
     lap("persons");
@@ -1555,7 +1565,6 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     // Large buffers are left for the OS to reclaim at exit.
     std::mem::forget(p1);
     std::mem::forget(click_sorted);
-    std::mem::forget(dense_map);
     std::mem::forget(ev_region);
     std::mem::forget(cl_region);
     std::mem::forget(sh);
