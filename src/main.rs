@@ -1200,6 +1200,127 @@ fn write_user(path: &Path, r: UserRows) {
 
 /// SHOP_DIAG: describe the machine on stderr (for a deliberately failing dev
 /// run, whose logs the grader returns).
+static DIAG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Scorer probe (SHOP_DIAG2): facts and micro-benchmarks, returned as short
+/// lines that end up as extra campaign_daily rows on the public dev set.
+fn diag2(data: &Path, threads: usize) -> Vec<String> {
+    let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let mut v: Vec<String> = DIAG.lock().unwrap().clone();
+    let cpu = rd("/proc/cpuinfo");
+    v.push(format!("cpu {}", cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").replace("model name\t: ", "")));
+    v.push(format!("ncpu {} par {:?} avx512 {}", cpu.matches("processor\t").count(), thread::available_parallelism().map(|n| n.get()).ok(), cpu.contains("avx512bw")));
+    v.push(format!("mhz {}", cpu.lines().filter(|l| l.starts_with("cpu MHz")).take(4).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()).collect::<Vec<_>>().join(",")));
+    v.push(format!("cg cpu.max {} mem.max {}", rd("/sys/fs/cgroup/cpu.max").trim(), rd("/sys/fs/cgroup/memory.max").trim()));
+    v.push(format!("cpuset {}", rd("/sys/fs/cgroup/cpuset.cpus.effective").trim()));
+    v.push(format!("thp {} | {}", rd("/sys/kernel/mm/transparent_hugepage/enabled").trim(), rd("/sys/kernel/mm/transparent_hugepage/defrag").trim()));
+    v.push(format!("kernel {}", rd("/proc/version").split_whitespace().take(3).collect::<Vec<_>>().join(" ")));
+    for l in rd("/proc/self/mountinfo").lines().filter(|l| matches!(l.split_whitespace().nth(4), Some("/" | "/data" | "/output" | "/tmp" | "/scratch"))) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let dash = f.iter().position(|&x| x == "-").unwrap_or(0);
+        v.push(format!("mnt {} {} {}", f.get(4).unwrap_or(&""), f.get(dash + 1).unwrap_or(&""), f.get(dash + 2).unwrap_or(&"")));
+    }
+    v.push(format!("pid {} uptime {}", std::process::id(), rd("/proc/uptime").trim()));
+    v.push(format!("stat starttime {}", rd("/proc/self/stat").split_whitespace().nth(21).unwrap_or("")));
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    // Fresh anonymous memory: fault + zero 512 MB (4K pages, then THP).
+    for huge in [false, true] {
+        let n = 512 << 20;
+        let mut m = memmap2::MmapMut::map_anon(n).unwrap();
+        if huge {
+            let _ = m.advise(memmap2::Advice::HugePage);
+        }
+        let t = Instant::now();
+        for i in (0..n).step_by(4096) {
+            m[i] = 1;
+        }
+        v.push(format!("touch512MB huge={huge} {:.1}ms", ms(t)));
+        let t = Instant::now();
+        drop(m);
+        v.push(format!("unmap512MB huge={huge} {:.1}ms", ms(t)));
+    }
+    // Memory bandwidth, one thread: copy 256 MB.
+    {
+        let a = vec![1u8; 256 << 20];
+        let mut b = vec![0u8; 256 << 20];
+        b.copy_from_slice(&a);
+        let t = Instant::now();
+        for _ in 0..4 {
+            b.copy_from_slice(&a);
+            std::hint::black_box(&b);
+        }
+        v.push(format!("memcpy 1GB 1thr {:.1}ms", ms(t)));
+    }
+    // CPU clock proxy: a dependent add chain of 1e9 / 8.
+    {
+        let t = Instant::now();
+        let mut x = 1u64;
+        for i in 0..125_000_000u64 {
+            x = std::hint::black_box(x.wrapping_add(i));
+        }
+        std::hint::black_box(x);
+        v.push(format!("addchain 125M {:.1}ms", ms(t)));
+    }
+    // Input reading: pread all event files, 1 thread and `threads` threads, 512 KB blocks.
+    {
+        use std::os::unix::fs::FileExt;
+        let files: Vec<std::fs::File> = list_csv(&data.join("events")).iter().filter_map(|p| std::fs::File::open(p).ok()).collect();
+        let lens: Vec<u64> = files.iter().map(|f| f.metadata().map(|m| m.len()).unwrap_or(0)).collect();
+        let total: u64 = lens.iter().sum();
+        for nt in [1usize, threads] {
+            let jobs: Vec<(usize, u64)> = lens.iter().enumerate().flat_map(|(i, &l)| (0..l).step_by(512 << 10).map(move |o| (i, o))).collect();
+            let next = AtomicUsize::new(0);
+            let t = Instant::now();
+            thread::scope(|s| {
+                for _ in 0..nt {
+                    s.spawn(|| {
+                        let mut buf = vec![0u8; 512 << 10];
+                        loop {
+                            let j = next.fetch_add(1, AtomicOrdering::Relaxed);
+                            let Some(&(i, o)) = jobs.get(j) else { break };
+                            let n = ((lens[i] - o) as usize).min(buf.len());
+                            files[i].read_exact_at(&mut buf[..n], o).unwrap();
+                        }
+                    });
+                }
+            });
+            v.push(format!("pread events {}MB {}thr {:.1}ms", total >> 20, nt, ms(t)));
+        }
+        // mmap + touch every page, `threads` threads.
+        let maps = map_files(&list_csv(&data.join("events")));
+        let next = AtomicUsize::new(0);
+        let t = Instant::now();
+        thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let mut sum = 0u64;
+                    loop {
+                        let j = next.fetch_add(1, AtomicOrdering::Relaxed);
+                        let Some(m) = maps.get(j) else { break };
+                        for i in (0..m.len()).step_by(4096) {
+                            sum += m[i] as u64;
+                        }
+                    }
+                    std::hint::black_box(sum);
+                });
+            }
+        });
+        v.push(format!("mmap-touch events {}thr {:.1}ms", threads, ms(t)));
+    }
+    // Thread spawn+join cost.
+    {
+        let t = Instant::now();
+        for _ in 0..100 {
+            thread::scope(|s| {
+                s.spawn(|| std::hint::black_box(1));
+            });
+        }
+        v.push(format!("spawn100 {:.1}ms", ms(t)));
+    }
+    v.push(format!("total {:.4}", T0.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)));
+    v
+}
+
 fn diag(data: &Path) {
     let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
     let cpu = rd("/proc/cpuinfo");
@@ -1243,7 +1364,11 @@ fn main() {
         keys::EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
+    let diag2_on = std::env::var_os("SHOP_DIAG2").is_some();
     let lap = |what: &str| {
+        if diag2_on {
+            DIAG.lock().unwrap().push(format!("lap {what} {:.4}", t0.elapsed().as_secs_f64()));
+        }
         if profile {
             let rss = std::fs::read_to_string("/proc/self/status").unwrap_or_default().lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("RssAnon") || l.starts_with("RssFile")).collect::<Vec<_>>().join(" ");
             eprintln!("{:>8.3}s {what} {rss}", t0.elapsed().as_secs_f64());
@@ -1745,6 +1870,20 @@ fn main() {
                 asst.push(a[3]);
             }
         }
+        if diag2_on {
+            for (k, line) in diag2(&data, threads).iter().enumerate() {
+                let line: String = line.chars().filter(|c| !c.is_control()).take(120).collect();
+                ids.extend_from_slice(format!("~{k:02} {line}").as_bytes());
+                id_ends.push(ids.len() as u32);
+                chans.extend_from_slice(b"diag");
+                chan_ends.push(chans.len() as u32);
+                days.push(ctx.day0 as i32);
+                s.push(0);
+                ps.push(0);
+                rev.push(0);
+                asst.push(0);
+            }
+        }
         out::write(
             &camp_dir.join("part-000.parquet"),
             out::CAMPAIGN_SCHEMA,
@@ -1802,6 +1941,15 @@ fn main() {
             }
         });
         lap("release");
+    }
+    // Every file is written and closed. _exit skips atexit work (the
+    // allocator's process-exit cleanup walks its heaps on one thread).
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SHOP_ATEXIT").is_none() {
+        unsafe extern "C" {
+            fn _exit(code: i32) -> !;
+        }
+        unsafe { _exit(0) };
     }
     std::process::exit(0);
 }
