@@ -482,7 +482,9 @@ fn huge_slice<T: Copy>(n: usize) -> &'static mut [T] {
     let bytes = (n * std::mem::size_of::<T>()).max(4096);
     let mut m = memmap2::MmapMut::map_anon(bytes).expect("huge alloc");
     #[cfg(target_os = "linux")]
-    let _ = m.advise(memmap2::Advice::HugePage);
+    if std::env::var_os("SHOP_NOHUGE").is_none() {
+        let _ = m.advise(memmap2::Advice::HugePage);
+    }
     let p = m.as_mut_ptr() as *mut T;
     std::mem::forget(m);
     unsafe { std::slice::from_raw_parts_mut(p, n) }
@@ -1184,7 +1186,9 @@ fn main() {
         #[cfg(unix)]
         {
             let all: Vec<&Mmap> = event_files.iter().chain(click_files.iter()).collect();
-            scope.spawn(move || readahead_all(&all));
+            if std::env::var_os("SHOP_NORA").is_none() {
+                scope.spawn(move || readahead_all(&all));
+            }
         }
         scope.spawn(|| {
             let t = Instant::now();

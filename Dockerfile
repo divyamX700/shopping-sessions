@@ -31,6 +31,6 @@ RUN set -e; \
 
 FROM scratch
 COPY --from=build /shopping /shopping
-ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 FAST_NO512=1
+ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8 FAST_NO512=1 SHOP_NOHUGE=1 SHOP_NORA=1
 USER 1000:1000
 CMD ["/shopping"]

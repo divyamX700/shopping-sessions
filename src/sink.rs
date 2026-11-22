@@ -33,7 +33,9 @@ impl Region {
         {
             let mut map = memmap2::MmapMut::map_anon(size).expect("reserve memory");
             #[cfg(target_os = "linux")]
-            let _ = map.advise(memmap2::Advice::HugePage);
+            if std::env::var_os("SHOP_NOHUGE").is_none() {
+                let _ = map.advise(memmap2::Advice::HugePage);
+            }
             let raw = map.as_mut_ptr();
             // Align the first block to BLOCK (mmap gives page alignment).
             let off = raw.align_offset(BLOCK).min(BLOCK);
