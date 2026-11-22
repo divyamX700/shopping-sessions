@@ -1422,17 +1422,36 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         agg.cl.sort_unstable_by_key(|c| (c.cts, c.key));
         agg.cl.dedup_by_key(|c| (c.cts, c.key));
         let k0 = key(buf[0].alias as u32);
-        let single = buf.iter().all(|e| key(e.alias as u32) == k0);
-        let mut keys: Vec<u32> = if single { vec![k0] } else { buf.iter().map(|e| key(e.alias as u32)).collect() };
-        keys.sort_unstable();
-        keys.dedup();
-        for &kk in &keys {
-            agg.ev2.clear();
-            agg.ev2.extend(buf.iter().filter(|e| single || key(e.alias as u32) == kk));
-            agg.cl2.clear();
-            let cl = std::mem::take(&mut agg.cl);
-            agg.cl2.extend(cl.iter().filter(|c| key(c.alias as u32) == kk));
-            agg.cl = cl;
+        let single = buf.iter().all(|e| key(e.alias as u32) == k0) && agg.cl.iter().all(|c| key(c.alias as u32) == k0);
+        let mut keys = [0u32; 32];
+        let nk = if single {
+            keys[0] = k0;
+            1
+        } else {
+            let mut seen = 0u32;
+            for e in buf.iter() {
+                seen |= 1 << key(e.alias as u32);
+            }
+            let mut n = 0;
+            while seen != 0 {
+                keys[n] = seen.trailing_zeros();
+                seen &= seen - 1;
+                n += 1;
+            }
+            n
+        };
+        for &kk in &keys[..nk] {
+            if single {
+                std::mem::swap(&mut agg.ev2, buf);
+                std::mem::swap(&mut agg.cl2, &mut agg.cl);
+            } else {
+                agg.ev2.clear();
+                agg.ev2.extend(buf.iter().filter(|e| key(e.alias as u32) == kk));
+                agg.cl2.clear();
+                let cl = std::mem::take(&mut agg.cl);
+                agg.cl2.extend(cl.iter().filter(|c| key(c.alias as u32) == kk));
+                agg.cl = cl;
+            }
             // Name: smallest ID of the component (or the lone ID).
             agg.name.clear();
             if kk >= 16 {
@@ -1451,6 +1470,10 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
             let name = std::mem::take(&mut agg.name);
             agg.person(ctx, &name);
             agg.name = name;
+            if single {
+                std::mem::swap(&mut agg.ev2, buf);
+                std::mem::swap(&mut agg.cl2, &mut agg.cl);
+            }
         }
     }
     if sh.abort.load(Relaxed) {
