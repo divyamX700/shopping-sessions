@@ -9,6 +9,10 @@ on:
         description: "Extra env for our runs"
         required: false
         default: ""
+      build_env:
+        description: "Build-time env for our binary (SHOP_Q_BITS=10 ...)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -23,7 +27,7 @@ jobs:
         run: |
           nproc; lscpu | grep "Model name"; grep -o -m1 avx512bw /proc/cpuinfo || echo "no avx512"
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
-          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
+          env ${{ github.event.inputs.build_env }} RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
           git clone -q https://github.com/loveconnor/larp-shopping-sessions-v5 /tmp/larp
           (cd /tmp/larp/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
           ls /tmp/larp/native/target/release/ | head
