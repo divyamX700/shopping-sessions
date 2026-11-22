@@ -1545,6 +1545,13 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         .expect("write campaign_daily");
     });
     lap("write");
+    if profile {
+        if let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            for l in t.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")) {
+                eprintln!("{l}");
+            }
+        }
+    }
     // Large buffers are left for the OS to reclaim at exit.
     std::mem::forget(p1);
     std::mem::forget(click_sorted);
