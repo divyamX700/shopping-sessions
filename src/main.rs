@@ -539,6 +539,36 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, aliases: &Aliases, out: &mut Sink<PCl>
     out.push(part(ph, Q_BITS), PCl { person, ckey: keys::key(f[0], b'k'), ts: (t - ctx.cws) as u32, camp });
 }
 
+/// A valid click with its raw user key in `person` (resolved later, in a
+/// batch with prefetching: the alias table is far bigger than cache).
+#[inline(always)]
+fn parse_click_raw(f: &[&[u8]; 4], ctx: &Ctx, out: &mut Vec<PCl>) {
+    if f[0].is_empty() || f[1].is_empty() {
+        return;
+    }
+    let Some(t) = ctx.tp.parse(f[3]) else { return };
+    if t < ctx.cws || t >= ctx.we {
+        return;
+    }
+    let Some(camp) = ctx.campaigns.get(f[2]) else { return };
+    out.push(PCl { person: keys::key(f[1], b'u'), ckey: keys::key(f[0], b'k'), ts: (t - ctx.cws) as u32, camp });
+}
+
+/// Resolve a chunk's clicks to persons (prefetching 16 ahead) and route them.
+fn route_clicks(pend: &[PCl], aliases: &Aliases, out: &mut Sink<PCl>) {
+    for i in 0..pend.len() {
+        if let Some(a) = pend.get(i + 16) {
+            aliases.prefetch(mix(a.person));
+        }
+        let mut c = pend[i];
+        let h = mix(c.person);
+        let person = aliases.person(c.person, h);
+        let ph = if person == c.person { h } else { mix(person) };
+        c.person = person;
+        out.push(part(ph, Q_BITS), c);
+    }
+}
+
 /// Every linked ID that is not its person's name -> the name. A bitmap in
 /// front of the table answers most lookups (IDs that are names) from cache.
 struct Aliases {
@@ -841,6 +871,8 @@ struct P1<'r> {
     ev: Sink<'r, Ev>,
     /// Clicks, already resolved to their person and partitioned by person.
     pc: Sink<'r, PCl>,
+    /// One chunk's parsed clicks before person resolution.
+    pend: Vec<PCl>,
 }
 
 struct P2<'r> {
@@ -1566,6 +1598,7 @@ fn main() {
     let aliases_cell: std::sync::OnceLock<Aliases> = std::sync::OnceLock::new();
     let populate_in = std::env::var_os("SHOP_POPULATE").is_some();
     let old_scan = std::env::var_os("SHOP_OLDSCAN").is_some();
+    let click_inline = std::env::var_os("SHOP_CLICK_INLINE").is_some();
     let p1 = thread::scope(|scope| {
         #[cfg(unix)]
         {
@@ -1592,6 +1625,7 @@ fn main() {
                 prof: [0.0; 2],
                 ev: Sink::new(&ev_region, P),
                 pc: { let mut s = Sink::new(&pc_region, Q); s.plain = pc_plain; s },
+                pend: Vec::new(),
             },
             |st, t| {
                 let tt = Instant::now();
@@ -1613,9 +1647,18 @@ fn main() {
                         { if populate_in { populate(&click_files[fi], a, b) } map_chunk(&click_files[fi], a, b) }
                     };
                     let slice: &[u8] = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
-                    let aliases = aliases_cell.wait();
-                    let (idx, pc, tsc) = (&mut st.idx, &mut st.pc, &mut st.tsc);
-                    if old_scan { index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc)); } else { scan::lines::<4>(slice, |f| parse_click(f, &ctx, aliases, pc, tsc)); }
+                    if click_inline {
+                        let aliases = aliases_cell.wait();
+                        let (idx, pc, tsc) = (&mut st.idx, &mut st.pc, &mut st.tsc);
+                        if old_scan { index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc)); } else { scan::lines::<4>(slice, |f| parse_click(f, &ctx, aliases, pc, tsc)); }
+                    } else {
+                        // Parse first (needs no links), then resolve persons in a batch.
+                        st.pend.clear();
+                        let pend = &mut st.pend;
+                        scan::lines::<4>(slice, |f| parse_click_raw(f, &ctx, pend));
+                        let aliases = aliases_cell.wait();
+                        route_clicks(&st.pend, aliases, &mut st.pc);
+                    }
                 }
                 if release_input && map_input {
                     let slice = if t < n_event_chunks {
