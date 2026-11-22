@@ -97,11 +97,11 @@ jobs:
       - name: Where container time goes
         run: |
           N=$(nproc)
-          for flags in "--cpus $N --memory 14g --memory-swap 14g" "--memory 14g --memory-swap 14g" "--cpus $N" "" "--cpus $N --memory 14g --memory-swap 14g -e FAST_READ=1"; do
+          for flags in "--cpus $N" "--cpus $N -e FAST_K=8" "--cpus $N --tmpfs /output:rw,size=2g,mode=1777" "--cpus $N -e FAST_SCANONLY=2"; do
           for k in 1 2; do
           out=$(mktemp -d); chmod 777 "$out"
           s=$(date +%s.%N)
-          r=$(docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 $flags --user 1000:1000             -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$N" -e SHOP_PROFILE=1 cur 2>&1 | grep -E "epoch main end" | awk '{print $4}' || true)
+          r=$(docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 $flags --user 1000:1000             -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$N" -e SHOP_PROFILE=1 cur 2>&1 | grep -E "epoch main (end|start)" | tail -1 | awk '{print $4}' || true)
           e=$(date +%s.%N)
           echo "flags [$flags] wall $(python3 -c "print(round($e-$s,3))") exit-latency $(python3 -c "print(round($e-${r:-0},3))")"
           done; done

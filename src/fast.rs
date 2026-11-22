@@ -1120,6 +1120,10 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         eprintln!("parse cpu: links {:.3} clicks {:.3} events {:.3}", c[0], c[1], c[2]);
     }
     if scan_only || km != 0 {
+        if profile {
+            let e = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+            eprintln!("epoch main end {:.3}", e.as_secs_f64());
+        }
         std::process::exit(0);
     }
     if sh.abort.load(Relaxed) {
