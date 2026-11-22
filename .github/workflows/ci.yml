@@ -125,4 +125,7 @@ jobs:
           rm -rf "$RUNNER_TEMP/s5" "$RUNNER_TEMP/dev"
           tools/generator/target/release/generate --seed 77 --events 60000000 --clicks 15000000 --output "$RUNNER_TEMP/p60" | tail -1
           a=$(mktemp -d)
-          /usr/bin/time -v env SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p60" OUTPUT_DIR="$a" NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast|general|Maximum resident|Elapsed" | tail -14
+          SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p60" OUTPUT_DIR="$a" NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast|general|Rss|AnonHuge" | tail -16
+          b=$(mktemp -d)
+          SHOP_NOFAST=1 DATA_DIR="$RUNNER_TEMP/p60" OUTPUT_DIR="$b" NCPU=$(nproc) ./target/release/shopping
+          echo "p60: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
