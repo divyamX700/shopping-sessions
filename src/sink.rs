@@ -54,6 +54,11 @@ impl Region {
         }
     }
 
+    /// The bytes handed out so far: (start, length).
+    pub fn used(&self) -> (usize, usize) {
+        (self.base as usize, self.next.load(Ordering::Relaxed).min(self.size))
+    }
+
     /// Hand blocks (no longer read by anyone) back for reuse.
     pub fn recycle(&self, blocks: impl Iterator<Item = *mut u8>) {
         let mut f = self.free.lock().unwrap();

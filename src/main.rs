@@ -56,7 +56,7 @@ const P: usize = 1 << P_BITS;
 const Q_BITS: u32 = env_num(option_env!("SHOP_Q_BITS"), 10) as u32;
 const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
-const CHUNK: usize = env_num(option_env!("SHOP_CHUNK_KB"), 2048) << 10;
+const CHUNK: usize = env_num(option_env!("SHOP_CHUNK_KB"), 512) << 10;
 const EMPTY: u64 = u64::MAX;
 /// `ip` = ingest seconds (biased, 40 bits) << 24 | price (24 bits).
 const PRICE_MASK: u64 = (1 << 24) - 1;
@@ -247,7 +247,7 @@ fn pool_finish<S: Send>(
 fn read_chunk<'b>(f: &std::fs::File, a: usize, b: usize, len: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
     use std::os::unix::fs::FileExt;
     let lo = a.max(1) - 1;
-    let mut over = 64 << 10;
+    let mut over = 4 << 10;
     loop {
         let hi = (b + over).min(len);
         let n = hi - lo;
@@ -847,12 +847,27 @@ struct P3 {
     prof: [f64; 4],
     ra: Vec<(u64, u32)>,
     rb: Vec<(u64, u32)>,
+    /// Dense person id of each event, in input order (scatter grouping).
+    loc: Vec<u32>,
     ca: Vec<(u64, C3)>,
     cb: Vec<(u64, C3)>,
 }
 
 /// Stable LSD radix sort on bits 32..63 of the key (three passes of 11, 11
 /// and 10 bits): a whole partition in time order in three linear passes.
+#[inline]
+fn insertion_sort(s: &mut [u64]) {
+    for i in 1..s.len() {
+        let x = s[i];
+        let mut j = i;
+        while j > 0 && s[j - 1] > x {
+            s[j] = s[j - 1];
+            j -= 1;
+        }
+        s[j] = x;
+    }
+}
+
 fn radix_ts<T: Copy>(a: &mut Vec<(u64, T)>, b: &mut Vec<(u64, T)>) {
     let n = a.len();
     if n < 2 {
@@ -1287,6 +1302,7 @@ fn main() {
     let event_bytes: usize = event_files.iter().map(|m| m.len()).sum();
     let click_bytes: usize = click_files.iter().map(|m| m.len()).sum();
     let ev_region = Region::new(event_bytes / 32 * std::mem::size_of::<Ev>() + Sink::<Ev>::slack(P) * threads);
+    let filt_emit = std::env::var_os("SHOP_FILTEMIT").is_some();
     let recycle_ev = std::env::var_os("SHOP_NORECYCLE").is_none();
     let pe_region = Region::new(if recycle_ev { 0 } else { 1 } * event_bytes / 32 * std::mem::size_of::<PEv>() + Sink::<PEv>::slack(Q) * threads);
     let pc_region = Region::new(click_bytes / 24 * std::mem::size_of::<PCl>() + Sink::<PCl>::slack(Q) * threads);
@@ -1428,7 +1444,7 @@ fn main() {
                     return;
                 }
                 let h = mix(e.ukey);
-                let person = aliases.person(e.ukey, h);
+                let person = if filt_emit { aliases.person_filtered(e.ukey, h) } else { aliases.person(e.ukey, h) };
                 st_pe.push(part(if person == e.ukey { h } else { mix(person) }, Q_BITS), PEv {
                     person,
                     w: (e.ts as u64) << 32 | price << 8 | e.cat as u64,
@@ -1440,7 +1456,7 @@ fn main() {
                 for sl in w.ev.slices(t) {
                 for (k, e) in sl.iter().enumerate() {
                     if let Some(a) = sl.get(k + 16) {
-                        aliases.prefetch(mix(a.ukey));
+                        if !filt_emit { aliases.prefetch(mix(a.ukey)); }
                     }
                     let j0 = j;
                     j += 1;
@@ -1496,6 +1512,7 @@ fn main() {
     std::fs::create_dir_all(&camp_dir).expect("create campaign_daily");
     let wrote_user = std::sync::atomic::AtomicBool::new(false);
     let ncamp = ctx.camp_ids.len();
+    let radix_group = std::env::var_os("SHOP_RADIXGROUP").is_some();
     // Largest person partitions first, so no thread is left with a big tail.
     let mut order: Vec<usize> = (0..Q).collect();
     order.sort_by_key(|&q| {
@@ -1522,6 +1539,7 @@ fn main() {
             prof: [0.0; 4],
             ra: Vec::new(),
             rb: Vec::new(),
+            loc: Vec::new(),
             ca: Vec::new(),
             cb: Vec::new(),
         },
@@ -1538,7 +1556,12 @@ fn main() {
             st.eidx.clear();
             st.eoff.clear();
             st.ra.clear();
-            st.ra.reserve(ne);
+            st.loc.clear();
+            if radix_group {
+                st.ra.reserve(ne);
+            } else {
+                st.loc.reserve(ne);
+            }
             for w in &p2 {
                 for e in w.pe.slices(q).flatten() {
                     let (i, new) = st.index.get_or_insert(e.person, st.persons.len() as u32);
@@ -1547,7 +1570,11 @@ fn main() {
                         st.eoff.push(0);
                     }
                     st.eoff[i as usize] += 1;
-                    st.ra.push((e.w, i));
+                    if radix_group {
+                        st.ra.push((e.w, i));
+                    } else {
+                        st.loc.push(i);
+                    }
                 }
             }
             let np = st.persons.len();
@@ -1561,15 +1588,38 @@ fn main() {
             st.eoff.push(run);
             // Time order first (radix), then a stable scatter by person:
             // every person's events end up sorted without per-person sorts.
-            radix_ts(&mut st.ra, &mut st.rb);
             st.evs.clear();
             st.evs.resize(ne, 0);
-            {
+            if radix_group {
+                radix_ts(&mut st.ra, &mut st.rb);
                 let mut cursor: Vec<u32> = st.eoff[..np].to_vec();
                 for &(w, i) in &st.ra {
                     let c = &mut cursor[i as usize];
                     st.evs[*c as usize] = w;
                     *c += 1;
+                }
+            } else {
+                // One scatter of 8-byte values by person, then each person's
+                // (short, often already ordered) run sorted by time in cache.
+                let mut cursor: Vec<u32> = st.eoff[..np].to_vec();
+                let mut k = 0usize;
+                for w in &p2 {
+                    for e in w.pe.slices(q).flatten() {
+                        let c = unsafe { cursor.get_unchecked_mut(*st.loc.get_unchecked(k) as usize) };
+                        unsafe { *st.evs.get_unchecked_mut(*c as usize) = e.w };
+                        *c += 1;
+                        k += 1;
+                    }
+                }
+                for p in 0..np {
+                    let s = &mut st.evs[st.eoff[p] as usize..st.eoff[p + 1] as usize];
+                    if !s.is_sorted() {
+                        if s.len() <= 24 {
+                            insertion_sort(s);
+                        } else {
+                            s.sort_unstable();
+                        }
+                    }
                 }
             }
             // Clicks of persons that have events.
@@ -1711,6 +1761,41 @@ fn main() {
         let _ = std::fs::remove_dir_all(outdir.join("campaign_daily"));
         eprintln!("diag: removed campaign_daily on purpose");
     }
-    // Skip freeing everything: the OS reclaims it at exit.
+    // The process's teardown frees every page on one thread, inside the timed
+    // run: drop the big regions first, all threads at once, 32 MB at a time.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SHOP_NOFREE").is_none() {
+        let mut spans: Vec<(usize, usize)> = vec![ev_region.used(), pe_region.used(), pc_region.used()];
+        spans.push((aliases.slots.as_ptr() as usize, std::mem::size_of_val(&*aliases.slots)));
+        spans.push((aliases.filter.as_ptr() as usize, std::mem::size_of_val(&*aliases.filter)));
+        for m in event_files.iter().chain(click_files.iter()) {
+            spans.push((m.as_ptr() as usize, m.len()));
+        }
+        const PIECE: usize = 32 << 20;
+        let mut pieces = Vec::new();
+        for (a, n) in spans {
+            let (from, to) = ((a + 4095) & !4095, (a + n) & !4095);
+            let mut p = from;
+            while p < to {
+                let e = (p + PIECE).min(to);
+                pieces.push((p, e - p));
+                p = e;
+            }
+        }
+        unsafe extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        let next = AtomicUsize::new(0);
+        thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    let Some(&(p, n)) = pieces.get(i) else { break };
+                    unsafe { madvise(p as *mut _, n, 4) }; // MADV_DONTNEED
+                });
+            }
+        });
+        lap("release");
+    }
     std::process::exit(0);
 }
