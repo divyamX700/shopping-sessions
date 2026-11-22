@@ -118,6 +118,9 @@ thread_local! {
     static MY_STRIPE: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
+/// Expected long values per parsing thread (set from the input size).
+pub static LONG_HINT: AtomicUsize = AtomicUsize::new(0);
+
 /// Sorted unique long values, filled by `verify_longs`.
 static LONGS: std::sync::OnceLock<Vec<u128>> = std::sync::OnceLock::new();
 static VERIFIED: AtomicBool = AtomicBool::new(false);
@@ -136,7 +139,12 @@ fn long_key(v: u128) -> u64 {
         s
     });
     if s < STRIPES {
-        unsafe { (*STRIPE[s].0.get()).push(v) };
+        let list = unsafe { &mut *STRIPE[s].0.get() };
+        if list.capacity() == 0 {
+            // Sized once from the input (no doubling copies while parsing).
+            list.reserve(LONG_HINT.load(AO::Relaxed).max(1024));
+        }
+        list.push(v);
     } else {
         NEED_EXACT.store(true, AO::Relaxed);
     }

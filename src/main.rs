@@ -1553,6 +1553,8 @@ fn main() {
     let n_event_chunks = event_chunks.len();
     let event_bytes: usize = event_lens.iter().sum();
     let click_bytes: usize = click_lens.iter().sum();
+    // ~85-byte lines with 2 IDs each, about a quarter of IDs long: per-thread lists sized once.
+    keys::LONG_HINT.store((event_bytes + click_bytes) / 85 * 2 / 3 / threads.max(1), AtomicOrdering::Relaxed);
     let ev_region = Region::new(event_bytes / 32 * std::mem::size_of::<Ev>() + Sink::<Ev>::slack(P) * threads);
     let filt_emit = std::env::var_os("SHOP_FILTEMIT").is_some();
     let recycle_ev = std::env::var_os("SHOP_NORECYCLE").is_none();
