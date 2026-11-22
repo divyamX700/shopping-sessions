@@ -17,6 +17,7 @@ mod out;
 mod scan;
 mod sink;
 mod ts;
+mod tsp;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -147,6 +148,7 @@ struct Ctx {
     campaigns: Lookup,
     camp_ids: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
+    tp: tsp::Tsp,
 }
 
 /// A parsed event copy, routed by event_id.
@@ -371,6 +373,7 @@ fn load_ctx(data: &Path) -> Ctx {
         campaigns,
         camp_ids,
         channels,
+        tp: tsp::Tsp::new(ws, we),
     }
 }
 
@@ -403,7 +406,12 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut Sink<Ev>, tsc: &mut ts::
         return;
     }
     let ekey = keys::key(f[0], b'e');
-    let ingest = ts::parse_c(f[3], tsc);
+    // rules.md: ingest_ts is always valid F1; the lean parser handles it,
+    // anything unusual goes through the full one.
+    let ingest = match ctx.tp.ingest_rel(f[3], 0) {
+        Some(s) => Some(s * 1000),
+        None => ts::parse_c(f[3], tsc),
+    };
     let ingest_key = match ingest {
         Some(t) => (t.div_euclid(1000) + INGEST_BIAS).clamp(0, (1 << 40) - 1) as u64,
         None => (1 << 40) - 1,
@@ -413,7 +421,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, buckets: &mut Sink<Ev>, tsc: &mut ts::
         if f[1].is_empty() || f[5].is_empty() {
             break 'valid;
         }
-        let Some(t) = ts::parse_c(f[2], tsc) else { break 'valid };
+        let Some(t) = ctx.tp.parse(f[2]) else { break 'valid };
         if t < ctx.ws || t >= ctx.we {
             break 'valid;
         }
@@ -444,7 +452,7 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, aliases: &Aliases, out: &mut Sink<PCl>
     if f[0].is_empty() || f[1].is_empty() {
         return;
     }
-    let Some(t) = ts::parse_c(f[3], tsc) else { return };
+    let Some(t) = ctx.tp.parse(f[3]) else { return };
     if t < ctx.cws || t >= ctx.we {
         return;
     }
