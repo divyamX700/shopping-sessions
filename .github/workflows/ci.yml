@@ -96,10 +96,12 @@ jobs:
 
       - name: Where container time goes
         run: |
+          for k in 1 2; do
           out=$(mktemp -d); chmod 777 "$out"
           s=$(date +%s.%N)
-          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cpus "$(nproc)" --memory 14g --user 1000:1000             -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$(nproc)" -e SHOP_PROFILE=1 cur 2>&1 | grep -E "fast" | tail -4
-          e=$(date +%s.%N); echo "wall $(python3 -c "print(round($e-$s,3))")"
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cpus "$(nproc)" --memory 14g --user 1000:1000             -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -e NCPU="$(nproc)" -e SHOP_PROFILE=1 cur 2>&1 | grep -E "fast done|epoch|Rss|AnonHuge"
+          e=$(date +%s.%N); echo "docker start $s end $e wall $(python3 -c "print(round($e-$s,3))")"
+          done
           s=$(date +%s.%N); docker run --rm --network none --entrypoint /shopping -e DATA_DIR=/nonexistent cur >/dev/null 2>&1 || true; e=$(date +%s.%N); echo "empty container run $(python3 -c "print(round($e-$s,3))")"
           o2=$(mktemp -d); /usr/bin/time -f "direct: %e s wall, %M KB max RSS, %F major %R minor faults" env SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o2" NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "direct|fast done|Rss|AnonHuge" || true
           cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag || true

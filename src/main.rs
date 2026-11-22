@@ -1007,6 +1007,10 @@ fn main() {
     let t0 = Instant::now();
     let _ = T0.set(t0);
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
+    if profile {
+        let e = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        eprintln!("epoch main start {:.3}", e.as_secs_f64());
+    }
     let lap = |what: &str| {
         if profile {
             eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
@@ -1023,6 +1027,10 @@ fn main() {
     let ctx = load_ctx(&data);
     if std::env::var_os("SHOP_NOFAST").is_none() && fast::run(&ctx, &data, &outdir, threads.min(16), profile) {
         lap("fast done");
+        if profile {
+            let e = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+            eprintln!("epoch main end {:.3}", e.as_secs_f64());
+        }
         return;
     }
     if std::env::var_os("SHOP_BENCH_ALIAS").is_some() {
