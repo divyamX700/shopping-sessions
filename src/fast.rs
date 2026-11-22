@@ -269,6 +269,32 @@ impl Tsp {
         Some(dd as i64 * DAYMS + ((h * 60 + mi) * 60 + se) * 1000)
     }
 
+    /// `ingest_ts`, which rules.md guarantees is valid F1: whole seconds,
+    /// relative to `base_s`, without validating the digits.
+    #[inline(always)]
+    fn ingest_rel(&self, s: &[u8], base_s: i64) -> Option<i64> {
+        if s.len() != 20 {
+            return None;
+        }
+        let x = le8(s, 0) ^ u64::from_le_bytes(*b"0000-00-");
+        let t = le8(s, 11) ^ u64::from_le_bytes(*b"00:00:00");
+        let dp = x.wrapping_mul(10).wrapping_add(x >> 8);
+        let tp = t.wrapping_mul(10).wrapping_add(t >> 8);
+        let year = (dp & 0xFF) as i64 * 100 + ((dp >> 16) & 0xFF) as i64;
+        let month = ((dp >> 40) & 0xFF) as i64;
+        let day = ((s[8].wrapping_sub(b'0')) * 10 + s[9].wrapping_sub(b'0')) as i64;
+        let yi = year - self.y0;
+        if yi < 0 || yi >= self.ny || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return None;
+        }
+        let dd = self.days[((yi * 12 + month - 1) * 32 + day) as usize];
+        if dd == i32::MIN {
+            return None;
+        }
+        let secs = (tp & 0xFF) as i64 * 3600 + ((tp >> 24) & 0xFF) as i64 * 60 + ((tp >> 48) & 0xFF) as i64;
+        Some(dd as i64 * 86_400 + secs - base_s)
+    }
+
     #[inline(always)]
     pub(crate) fn parse(&self, s: &[u8]) -> Option<i64> {
         let n = s.len();
@@ -1010,20 +1036,22 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     if f[0].is_empty() {
                         return;
                     }
-                    let ing = if km & 2 != 0 {
-                        ws + 1000 * (f[3].len() as i64 + 100)
+                    let ing_rel = if km & 2 != 0 {
+                        f[3].len() as i64 + 100
                     } else {
-                        let Some(ing) = tp.parse(f[3]) else {
-                            sh.abort.store(true, Relaxed);
-                            return;
-                        };
-                        ing
+                        match tp.ingest_rel(f[3], sh.ing_base) {
+                            Some(v) => v,
+                            None => {
+                                sh.abort.store(true, Relaxed);
+                                return;
+                            }
+                        }
                     };
-                    let ing_rel = ing.div_euclid(1000) - sh.ing_base;
-                    if ing_rel <= 0 || ing_rel >= 1 << 22 || ing % 1000 != 0 {
+                    if ing_rel <= 0 || ing_rel >= 1 << 22 {
                         sh.abort.store(true, Relaxed);
                         return;
                     }
+                    let ing = (ing_rel + sh.ing_base) * 1000;
                     // Validity of this copy.
                     let mut lo = T_INVALID << 31;
                     let mut valid_ts = 0u32;

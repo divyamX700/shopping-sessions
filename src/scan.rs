@@ -130,7 +130,8 @@ fn lines_impl<'a, const N: usize, const W: bool>(data: &'a [u8], mut f: impl FnM
                         } else {
                             l
                         };
-                        let w = ((qs >> s) as u64 & 1) as usize;
+                        // Quotes are validated: a field is wrapped iff it starts with one.
+                        let w = unsafe { (*p.add(s) == b'"') as usize };
                         *slot = unsafe { std::slice::from_raw_parts(p.add(s + w), e - s - 2 * w) };
                         s = e + 1;
                     }
