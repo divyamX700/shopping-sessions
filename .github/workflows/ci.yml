@@ -96,7 +96,7 @@ jobs:
 
       - name: Where container time goes
         run: |
-          for k in "-e X=1" "-e FAST_READ=1" "-e X=1" "-e FAST_READ=1"; do
+          for k in "-e X=1" "-e SHOP_EXIT_NOW=1" "-e X=1" "-e SHOP_EXIT_NOW=1"; do
           echo "== $k"
           out=$(mktemp -d); chmod 777 "$out"
           s=$(date +%s.%N)

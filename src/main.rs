@@ -1004,6 +1004,9 @@ fn write_user(path: &Path, r: UserRows) {
 }
 
 fn main() {
+    if std::env::var_os("SHOP_EXIT_NOW").is_some() {
+        return;
+    }
     let t0 = Instant::now();
     let _ = T0.set(t0);
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
