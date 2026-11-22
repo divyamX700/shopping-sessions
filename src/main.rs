@@ -310,10 +310,9 @@ fn readahead_all(maps: &[&Mmap]) {
 /// Nothing is read here: with a cold page cache a serial scan for line ends
 /// cost ~1.5 s of single-threaded disk reads. Each worker moves its own
 /// range's ends to line boundaries (`line_span`).
-fn chunks(maps: &[Mmap]) -> Vec<(usize, usize, usize)> {
+fn chunks(lens: &[usize]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
-    for (fi, m) in maps.iter().enumerate() {
-        let len = m.len();
+    for (fi, &len) in lens.iter().enumerate() {
         let mut pos = 0;
         while pos < len {
             let end = (pos + CHUNK).min(len);
@@ -1278,12 +1277,15 @@ fn main() {
     if let Some(v) = std::env::var("SHOP_RA").ok().and_then(|v| v.parse().ok()) {
         scan::READ_AHEAD.store(v, std::sync::atomic::Ordering::Relaxed);
     }
-    let event_files = map_files(&list_csv(&data.join("events")));
-    let click_files = map_files(&list_csv(&data.join("clicks")));
+    // pread input (SHOP_PREAD): one large read per chunk, and no mapping of
+    // the inputs at all (SHOP_MAPIN maps them anyway, e.g. for SHOP_RELEASE).
+    let pread_input = std::env::var_os("SHOP_PREAD").is_some();
+    let map_input = !pread_input || std::env::var_os("SHOP_MAPIN").is_some();
+    let event_files = if map_input { map_files(&list_csv(&data.join("events"))) } else { Vec::new() };
+    let click_files = if map_input { map_files(&list_csv(&data.join("clicks"))) } else { Vec::new() };
     // pread input: one large read per chunk instead of page faults on a
     // mapping (much better when the page cache is cold). Same files, same
     // order as map_files.
-    let pread_input = std::env::var_os("SHOP_PREAD").is_some();
     let open_nonempty = |dir: &str| -> Vec<std::fs::File> {
         list_csv(&data.join(dir))
             .iter()
@@ -1296,11 +1298,14 @@ fn main() {
     let event_fds = if pread_input { open_nonempty("events") } else { Vec::new() };
     let click_fds = if pread_input { open_nonempty("clicks") } else { Vec::new() };
     let link_paths = list_csv(&data.join("links"));
-    let event_chunks = chunks(&event_files);
-    let click_chunks = chunks(&click_files);
+    let flen = |fs: &[std::fs::File]| -> Vec<usize> { fs.iter().map(|f| f.metadata().map(|m| m.len() as usize).unwrap_or(0)).collect() };
+    let event_lens: Vec<usize> = if pread_input { flen(&event_fds) } else { event_files.iter().map(|m| m.len()).collect() };
+    let click_lens: Vec<usize> = if pread_input { flen(&click_fds) } else { click_files.iter().map(|m| m.len()).collect() };
+    let event_chunks = chunks(&event_lens);
+    let click_chunks = chunks(&click_lens);
     let n_event_chunks = event_chunks.len();
-    let event_bytes: usize = event_files.iter().map(|m| m.len()).sum();
-    let click_bytes: usize = click_files.iter().map(|m| m.len()).sum();
+    let event_bytes: usize = event_lens.iter().sum();
+    let click_bytes: usize = click_lens.iter().sum();
     let ev_region = Region::new(event_bytes / 32 * std::mem::size_of::<Ev>() + Sink::<Ev>::slack(P) * threads);
     let filt_emit = std::env::var_os("SHOP_FILTEMIT").is_some();
     let recycle_ev = std::env::var_os("SHOP_NORECYCLE").is_none();
@@ -1314,7 +1319,7 @@ fn main() {
         #[cfg(unix)]
         {
             let all: Vec<&Mmap> = event_files.iter().chain(click_files.iter()).collect();
-            if std::env::var_os("SHOP_NORA").is_none() {
+            if map_input && std::env::var_os("SHOP_NORA").is_none() {
                 scope.spawn(move || readahead_all(&all));
             }
         }
@@ -1342,7 +1347,7 @@ fn main() {
                 if t < n_event_chunks {
                     let (fi, a, b) = event_chunks[t];
                     let slice: &[u8] = if pread_input {
-                        read_chunk(&event_fds[fi], a, b, event_files[fi].len(), &mut st.rbuf)
+                        read_chunk(&event_fds[fi], a, b, event_lens[fi], &mut st.rbuf)
                     } else {
                         map_chunk(&event_files[fi], a, b)
                     };
@@ -1352,7 +1357,7 @@ fn main() {
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
                     let slice: &[u8] = if pread_input {
-                        read_chunk(&click_fds[fi], a, b, click_files[fi].len(), &mut st.rbuf)
+                        read_chunk(&click_fds[fi], a, b, click_lens[fi], &mut st.rbuf)
                     } else {
                         map_chunk(&click_files[fi], a, b)
                     };
@@ -1361,7 +1366,7 @@ fn main() {
                     let (idx, pc, tsc) = (&mut st.idx, &mut st.pc, &mut st.tsc);
                     if std::env::var_os("SHOP_OLDSCAN").is_some() { index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc)); } else { scan::lines::<4>(slice, |f| parse_click(f, &ctx, aliases, pc, tsc)); }
                 }
-                if release_input {
+                if release_input && map_input {
                     let slice = if t < n_event_chunks {
                         let (fi, a, b) = event_chunks[t];
                         map_chunk(&event_files[fi], a, b)
@@ -1384,6 +1389,7 @@ fn main() {
     // Every parsing thread has finished: check the long-ID keys (see keys.rs).
     // In the rare case a key is shared or a comparison could not be settled,
     // run again from the start with exact long-ID interning (nothing is written yet).
+    lap("parse-joined");
     if !keys::verify_longs(threads) {
         if profile {
             eprintln!("long IDs: key collision or undecided comparison -> exact re-run");
@@ -1683,7 +1689,7 @@ fn main() {
         |st, i| {
             if !st.rows.days.is_empty() {
                 let r = std::mem::take(&mut st.rows);
-                write_user(&user_dir.join(format!("part-{i:03}.parquet")), r);
+                let tw = Instant::now(); write_user(&user_dir.join(format!("part-{i:03}.parquet")), r); if profile { eprintln!("  encode thread {i} {:.3}s at {:.3}s", tw.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64()); }
                 wrote_user.store(true, AtomicOrdering::Relaxed);
             }
         },
@@ -1783,7 +1789,7 @@ fn main() {
             }
         }
         unsafe extern "C" {
-            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
         }
         let next = AtomicUsize::new(0);
         thread::scope(|s| {

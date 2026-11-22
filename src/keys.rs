@@ -159,41 +159,105 @@ pub fn verify_longs(threads: usize) -> bool {
         VERIFIED.store(true, AO::Relaxed);
         return true;
     }
-    // Bucket by the top 8 bits (values are spread out), then sort buckets in parallel.
+    // Bucket by the top 8 bits (values are spread out) straight into one
+    // table, every step in parallel: per-list histograms, offsets, scatter,
+    // then sort each bucket's slice. Repeated values stay (the lookup's
+    // partition_point finds the first); a collision is two different
+    // values with one key.
     const B: usize = 256;
-    let mut buckets: Vec<Vec<u128>> = (0..B).map(|_| Vec::with_capacity(total / B + 16)).collect();
-    for list in all.drain(..) {
-        for v in list {
-            buckets[(v >> 120) as usize].push(v);
+    let threads = threads.max(1);
+    let n = all.len();
+    let hist: Vec<[u32; B]> = {
+        let next = AtomicUsize::new(0);
+        let out: Vec<UnsafeCell<[u32; B]>> = (0..n).map(|_| UnsafeCell::new([0; B])).collect();
+        struct S<'a>(&'a [UnsafeCell<[u32; B]>]);
+        unsafe impl Sync for S<'_> {}
+        let o = S(&out);
+        std::thread::scope(|sc| {
+            for _ in 0..threads.min(n) {
+                sc.spawn(|| {
+                    let o = &o;
+                    loop {
+                        let i = next.fetch_add(1, AO::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        let h = unsafe { &mut *o.0[i].get() };
+                        for &v in &all[i] {
+                            h[(v >> 120) as usize] += 1;
+                        }
+                    }
+                });
+            }
+        });
+        out.into_iter().map(|c| c.into_inner()).collect()
+    };
+    // Bucket-major layout: bucket b holds list 0's values, then list 1's...
+    let mut start = [0usize; B + 1];
+    let mut off: Vec<[usize; B]> = vec![[0; B]; n];
+    let mut run = 0usize;
+    for b in 0..B {
+        start[b] = run;
+        for i in 0..n {
+            off[i][b] = run;
+            run += hist[i][b] as usize;
         }
     }
+    start[B] = run;
+    let mut table: Vec<u128> = Vec::with_capacity(total);
+    unsafe { table.set_len(total) };
+    struct P(*mut u128);
+    unsafe impl Sync for P {}
+    let tp = P(table.as_mut_ptr());
     let ok = AtomicBool::new(true);
-    let next = AtomicUsize::new(0);
-    let cells: Vec<UnsafeCellVec> = buckets.into_iter().map(|b| UnsafeCellVec(UnsafeCell::new(b))).collect();
-    std::thread::scope(|sc| {
-        for _ in 0..threads.max(1) {
-            sc.spawn(|| loop {
-                let i = next.fetch_add(1, AO::Relaxed);
-                if i >= B {
-                    break;
-                }
-                let b = unsafe { &mut *cells[i].0.get() };
-                b.sort_unstable();
-                b.dedup();
-                for w in b.windows(2) {
-                    if (w[0] >> 73) == (w[1] >> 73) {
-                        ok.store(false, AO::Relaxed);
+    {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..threads.min(n) {
+                sc.spawn(|| {
+                    let tp = &tp;
+                    loop {
+                        let i = next.fetch_add(1, AO::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        let mut o = off[i];
+                        for &v in &all[i] {
+                            let b = (v >> 120) as usize;
+                            unsafe { *tp.0.add(o[b]) = v };
+                            o[b] += 1;
+                        }
                     }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
+    }
+    {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(|| {
+                    let tp = &tp;
+                    loop {
+                        let b = next.fetch_add(1, AO::Relaxed);
+                        if b >= B {
+                            break;
+                        }
+                        let s = unsafe { std::slice::from_raw_parts_mut(tp.0.add(start[b]), start[b + 1] - start[b]) };
+                        s.sort_unstable();
+                        for w in s.windows(2) {
+                            if w[0] != w[1] && (w[0] >> 73) == (w[1] >> 73) {
+                                ok.store(false, AO::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    drop(all);
     if !ok.load(AO::Relaxed) {
         return false;
-    }
-    let mut table = Vec::with_capacity(total);
-    for c in cells {
-        table.extend(c.0.into_inner());
     }
     let _ = LONGS.set(table);
     VERIFIED.store(true, AO::Relaxed);
