@@ -884,6 +884,9 @@ struct P3 {
     rb: Vec<(u64, u32)>,
     /// Dense person id of each event, in input order (scatter grouping).
     loc: Vec<u32>,
+    /// The person whose name was written last, and where (in rows.names).
+    name_of: u64,
+    name_at: (usize, usize),
     ca: Vec<(u64, C3)>,
     cb: Vec<(u64, C3)>,
 }
@@ -960,7 +963,17 @@ impl P3 {
 
     fn flush_day(&mut self, ctx: &Ctx, person: u64, day: i64, s: i64, e: i64, rev: i64) {
         let r = &mut self.rows;
-        keys::bytes(person, b'u', &mut r.names);
+        // A person's name is built once (base36 or long-ID lookup), then
+        // copied for that person's further days.
+        let start = r.names.len();
+        if self.name_of == person && self.name_at.1 > self.name_at.0 && self.name_at.1 <= start {
+            let (a, b) = self.name_at;
+            r.names.extend_from_within(a..b);
+        } else {
+            keys::bytes(person, b'u', &mut r.names);
+        }
+        self.name_of = person;
+        self.name_at = (start, r.names.len());
         r.name_ends.push(r.names.len() as u32);
         r.days.push(day as i32);
         r.sessions.push(s as i32);
@@ -1756,6 +1769,8 @@ fn main() {
             ra: Vec::new(),
             rb: Vec::new(),
             loc: Vec::new(),
+            name_of: EMPTY,
+            name_at: (0, 0),
             ca: Vec::new(),
             cb: Vec::new(),
         },
