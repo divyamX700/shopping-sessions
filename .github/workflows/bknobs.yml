@@ -25,9 +25,9 @@ jobs:
           nproc; lscpu | grep -E "Model name"
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
           mkdir -p /tmp/bins
-          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q && cp target/release/shopping /tmp/bins/base
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q && cp target/release/shopping /tmp/bins/b$(echo base | md5sum | cut -c1-8)
           for b in $BUILDS; do
-            h=$(echo "$b" | md5sum | cut -c1-8); env $b RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q --target-dir /tmp/t$h 2>&1 | grep -E "^error" -A5 || true; cp /tmp/t$h/release/shopping "/tmp/bins/$b"; ls -la "/tmp/bins/$b"
+            h=$(echo "$b" | md5sum | cut -c1-8); env $b RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q --target-dir /tmp/t$h 2>&1 | grep -E "^error" -A5 || true; cp /tmp/t$h/release/shopping /tmp/bins/b$h
           done
           git clone -q https://github.com/loveconnor/larp-shopping-sessions-v5 /tmp/larp
           (cd /tmp/larp/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
@@ -43,7 +43,7 @@ jobs:
             for v in LARP base $BUILDS; do
               out=$(mktemp -d); s=$(date +%s.%N)
               if [ $v = LARP ]; then env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$out NCPU=$N $L >/dev/null 2>&1
-              else env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$out NCPU=$N MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_PREAD=1 "/tmp/bins/$v" >/dev/null 2>&1; fi
+              else env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$out NCPU=$N MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_PREAD=1 /tmp/bins/b$(echo "$v" | md5sum | cut -c1-8) >/dev/null 2>&1; fi
               e=$(date +%s.%N); echo "$v $(python3 -c "print(round($e-$s,4))")" | tee -a /tmp/t.txt; rm -rf $out
             done
           done
