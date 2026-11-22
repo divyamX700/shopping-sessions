@@ -1835,7 +1835,7 @@ fn main() {
             st.cls.clear();
             st.cls.resize(nc, C3::default());
             st.ca.clear();
-            {
+            if radix_group {
                 let mut k = 0;
                 for w in &p1 {
                     for c in w.pc.slices(q).flatten() {
@@ -1846,14 +1846,34 @@ fn main() {
                         }
                     }
                 }
-            }
-            radix_ts(&mut st.ca, &mut st.cb);
-            {
+                radix_ts(&mut st.ca, &mut st.cb);
                 let mut cursor: Vec<u32> = st.coff[..np].to_vec();
                 for &(key, c3) in &st.ca {
                     let c = &mut cursor[(key & 0xFFFF_FFFF) as usize];
                     st.cls[*c as usize] = c3;
                     *c += 1;
+                }
+            } else {
+                // One scatter by person, then each person's few clicks sorted
+                // by time (ties: person() breaks them by click id).
+                let mut cursor: Vec<u32> = st.coff[..np].to_vec();
+                let mut k = 0;
+                for w in &p1 {
+                    for c in w.pc.slices(q).flatten() {
+                        let i = unsafe { *st.eidx.get_unchecked(k) };
+                        k += 1;
+                        if i != NONE {
+                            let cur = unsafe { cursor.get_unchecked_mut(i as usize) };
+                            unsafe { *st.cls.get_unchecked_mut(*cur as usize) = C3 { ckey: c.ckey, ts: c.ts, camp: c.camp } };
+                            *cur += 1;
+                        }
+                    }
+                }
+                for p in 0..np {
+                    let s = &mut st.cls[st.coff[p] as usize..st.coff[p + 1] as usize];
+                    if s.len() > 1 && !s.is_sorted_by_key(|c| (c.ts, c.ckey)) {
+                        s.sort_unstable_by_key(|c| (c.ts, c.ckey));
+                    }
                 }
             }
             st.prof[0] += tt.elapsed().as_secs_f64();
