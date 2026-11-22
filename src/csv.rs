@@ -61,7 +61,17 @@ pub fn for_lines<'a>(data: &'a [u8], mut f: impl FnMut(&'a [u8])) {
 /// Bitmasks of `\n`, `,` and `"` in the 64 bytes at `p`.
 #[inline(always)]
 pub fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm512_loadu_si512(p.as_ptr() as *const _);
+        return (
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+        );
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
     unsafe {
         use std::arch::x86_64::*;
         let nl = _mm256_set1_epi8(b'\n' as i8);

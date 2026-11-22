@@ -11,11 +11,9 @@
 //! aggregate. Each worker writes its own user_daily Parquet file.
 
 mod csv;
-mod fast;
 mod index;
 mod keys;
 mod out;
-mod scan;
 mod sink;
 mod ts;
 
@@ -36,12 +34,27 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const GAP: i64 = 30 * 60 * 1000;
 const REACH: i64 = 7 * DAY;
-const P_BITS: u32 = 9;
+/// Build-time tuning overrides: SHOP_P_BITS, SHOP_Q_BITS, SHOP_CHUNK_KB.
+const fn env_num(s: Option<&str>, d: usize) -> usize {
+    match s {
+        None => d,
+        Some(s) => {
+            let b = s.as_bytes();
+            let (mut i, mut v) = (0, 0);
+            while i < b.len() {
+                v = v * 10 + (b[i] - b'0') as usize;
+                i += 1;
+            }
+            v
+        }
+    }
+}
+const P_BITS: u32 = env_num(option_env!("SHOP_P_BITS"), 9) as u32;
 const P: usize = 1 << P_BITS;
-const Q_BITS: u32 = 7;
+const Q_BITS: u32 = env_num(option_env!("SHOP_Q_BITS"), 7) as u32;
 const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
-const CHUNK: usize = 2 << 20;
+const CHUNK: usize = env_num(option_env!("SHOP_CHUNK_KB"), 2048) << 10;
 const EMPTY: u64 = u64::MAX;
 /// `ip` = ingest seconds (biased, 40 bits) << 24 | price (24 bits).
 const PRICE_MASK: u64 = (1 << 24) - 1;
@@ -988,32 +1001,75 @@ fn bench_alias(ctx: &Ctx, data: &Path) {
 }
 
 fn write_user(path: &Path, r: UserRows) {
-    out::write(
+    // Compact encodings: the output's size is paid again when the container
+    // exits (its dirty pages are written back), so bytes matter.
+    let rows = r.days.len();
+    let small = |v: Vec<i32>| -> out::DCol {
+        let (lo, hi) = (v.iter().copied().min().unwrap_or(0), v.iter().copied().max().unwrap_or(0));
+        if (hi as i64 - lo as i64) >= 1 << 20 {
+            return out::DCol::Delta(out::Col::I32(v));
+        }
+        let mut map = vec![u32::MAX; (hi as i64 - lo as i64 + 1) as usize];
+        let (mut dict, mut idx) = (Vec::new(), Vec::with_capacity(v.len()));
+        for &x in &v {
+            let m = &mut map[(x - lo) as usize];
+            if *m == u32::MAX {
+                *m = dict.len() as u32;
+                dict.push(x);
+            }
+            idx.push(*m);
+        }
+        out::DCol::Dict { dict: out::Col::I32(dict), idx, defs: None }
+    };
+    let rev = if r.revenue.iter().all(|&x| x <= i32::MAX as i64) {
+        out::Col::I32(r.revenue.iter().map(|&x| x as i32).collect())
+    } else {
+        out::Col::I64(r.revenue)
+    };
+    // top_category: a dictionary of the distinct names present.
+    let (mut db, mut de, mut tidx): (Vec<u8>, Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new(), Vec::new());
+    let mut names: Vec<&[u8]> = Vec::new();
+    let mut st = 0usize;
+    for &e in &r.top_ends {
+        let t = &r.top[st..e as usize];
+        st = e as usize;
+        let k = match names.iter().position(|n| *n == t) {
+            Some(k) => k,
+            None => {
+                names.push(t);
+                db.extend_from_slice(t);
+                de.push(db.len() as u32);
+                names.len() - 1
+            }
+        };
+        tidx.push(k as u32);
+    }
+    if de.is_empty() {
+        de.push(0);
+    }
+    out::write_dict(
         path,
         out::USER_SCHEMA,
         vec![
-            out::Col::Str(r.names, r.name_ends),
-            out::Col::I32(r.days),
-            out::Col::I32(r.sessions),
-            out::Col::I32(r.events),
-            out::Col::I64(r.revenue),
-            out::Col::OptStr(r.top, r.top_ends, r.top_defs),
+            out::DCol::DeltaStr(r.names, r.name_ends),
+            small(r.days),
+            small(r.sessions),
+            small(r.events),
+            out::DCol::Delta(rev),
+            out::DCol::Dict { dict: out::Col::Str(db, de), idx: tidx, defs: Some(r.top_defs) },
         ],
+        rows,
     )
     .expect("write user_daily");
 }
 
 fn main() {
-    if std::env::var_os("SHOP_EXIT_NOW").is_some() {
-        return;
-    }
     let t0 = Instant::now();
     let _ = T0.set(t0);
-    let profile = std::env::var_os("SHOP_PROFILE").is_some();
-    if profile {
-        let e = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-        eprintln!("epoch main start {:.3}", e.as_secs_f64());
+    if std::env::var_os("SHOP_EXACT_LONG").is_some() {
+        keys::EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    let profile = std::env::var_os("SHOP_PROFILE").is_some();
     let lap = |what: &str| {
         if profile {
             eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
@@ -1028,14 +1084,6 @@ fn main() {
         .unwrap_or_else(|| thread::available_parallelism().map_or(8, usize::from));
 
     let ctx = load_ctx(&data);
-    if std::env::var_os("SHOP_NOFAST").is_none() && fast::run(&ctx, &data, &outdir, threads.min(16), profile) {
-        lap("fast done");
-        if profile {
-            let e = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-            eprintln!("epoch main end {:.3}", e.as_secs_f64());
-        }
-        return;
-    }
     if std::env::var_os("SHOP_BENCH_ALIAS").is_some() {
         bench_alias(&ctx, &data);
         return;
@@ -1107,6 +1155,20 @@ fn main() {
         p1
     });
     let aliases = aliases_cell.into_inner().expect("links");
+    // Every parsing thread has finished: check the long-ID keys (see keys.rs).
+    // In the rare case a key is shared or a comparison could not be settled,
+    // run again from the start with exact long-ID interning (nothing is written yet).
+    if !keys::verify_longs(threads) {
+        if profile {
+            eprintln!("long IDs: key collision or undecided comparison -> exact re-run");
+        }
+        let status = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(std::env::args_os().skip(1))
+            .env("SHOP_EXACT_LONG", "1")
+            .status()
+            .expect("exact re-run");
+        std::process::exit(status.code().unwrap_or(1));
+    }
     if profile {
         let ev: f64 = p1.iter().map(|w| w.prof[0]).sum();
         let cl: f64 = p1.iter().map(|w| w.prof[1]).sum();

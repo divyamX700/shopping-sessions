@@ -39,7 +39,6 @@ jobs:
       - name: Fixtures (fast path on, and the general pipeline alone)
         run: |
           python3 scripts/run_fixtures.py fixtures -- "$PWD/target/release/shopping" | tail -2
-          SHOP_NOFAST=1 python3 scripts/run_fixtures.py fixtures -- "$PWD/target/release/shopping" | tail -1
 
       - name: Data
         run: |
@@ -48,13 +47,16 @@ jobs:
           $G --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" | tail -1
           $G --seed 9 --events 5000000 --clicks 1250000 --output "$RUNNER_TEMP/s5" | tail -1
 
-      - name: Exact diff, fast path vs general pipeline
+      - name: Exact diff against the team's scored v5 build (c4c9cb3) and the official dev answer
         run: |
+          git clone -q https://github.com/deltaparticle/Databricks-Buildathon /tmp/refsrc && (cd /tmp/refsrc && git checkout -q c4c9cb393d5f)
+          (cd /tmp/refsrc && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q) && cp /tmp/refsrc/target/release/shopping /tmp/refbin
           for d in dev s5 p20; do
             a=$(mktemp -d); b=$(mktemp -d)
-            SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$a" NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast|general" | tail -12
-            SHOP_NOFAST=1 DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$b" NCPU=$(nproc) ./target/release/shopping
-            echo "$d: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+            SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$a" NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "^ *[0-9.]+s " | tail -8
+            DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$b" NCPU=$(nproc) /tmp/refbin
+            echo "$d vs reference: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
+            [ $d = dev ] && echo "dev vs official answer: $(cd scripts && python3 compare.py "$a" ../tools/dev-answer | tail -1)"
           done
 
       - name: Output readable by polars, pyarrow and DuckDB alike
@@ -63,17 +65,11 @@ jobs:
           DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./target/release/shopping
           python3 scripts/readers.py "$o"
 
-      - name: Official dev answer
-        run: |
-          o=$(mktemp -d)
-          DATA_DIR="$RUNNER_TEMP/dev" OUTPUT_DIR="$o" ./target/release/shopping
-          ls tools/dev-answer >/dev/null 2>&1 && (cd scripts && python3 compare.py "$o" ../tools/dev-answer | tail -1) || echo "no dev answer in repo"
-
       - name: Container timing, scorer flags (alternating)
         run: |
           docker build -q -t cur . >/dev/null
           BASE="${{ github.event.inputs.base }}"
-          BASE=${BASE:-https://github.com/deltaparticle/Databricks-Buildathon@d3fb904bfe86c9958120418578f67d98ea958f12}
+          BASE=${BASE:-https://github.com/deltaparticle/Databricks-Buildathon@3380710f536d6c0e02f9d064c214f2a8843e6da5}
           if [ -n "$BASE" ]; then
             git clone -q "${BASE%@*}" /tmp/base && (cd /tmp/base && git checkout -q "${BASE##*@}")
             docker build -q -t base /tmp/base >/dev/null
@@ -125,7 +121,7 @@ jobs:
           rm -rf "$RUNNER_TEMP/s5" "$RUNNER_TEMP/dev"
           tools/generator/target/release/generate --seed 77 --events 60000000 --clicks 15000000 --output "$RUNNER_TEMP/p60" | tail -1
           a=$(mktemp -d)
-          SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p60" OUTPUT_DIR="$a" NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast|general|Rss|AnonHuge" | tail -16
+          SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p60" OUTPUT_DIR="$a" NCPU=$(nproc) ./target/release/shopping 2>&1 | tail -12
           b=$(mktemp -d)
-          SHOP_NOFAST=1 DATA_DIR="$RUNNER_TEMP/p60" OUTPUT_DIR="$b" NCPU=$(nproc) ./target/release/shopping
+          DATA_DIR="$RUNNER_TEMP/p60" OUTPUT_DIR="$b" NCPU=$(nproc) /tmp/refbin
           echo "p60: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"

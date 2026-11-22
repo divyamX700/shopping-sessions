@@ -51,6 +51,11 @@ impl Index {
         let mut tail = [0u8; 64];
         for b in 0..nb {
             let base = b * 64;
+            if PF_DIST > 0 {
+                // input pages are not physically contiguous, so the hardware
+                // prefetcher stops at page ends: fetch ahead in software
+                prefetch_read(t.as_ptr().wrapping_add(base + PF_DIST));
+            }
             let block: &[u8; 64] = if base + 64 <= len {
                 t[base..base + 64].try_into().unwrap()
             } else {
@@ -129,8 +134,38 @@ impl Index {
     }
 }
 
+/// Software prefetch distance in bytes for the input scan (0 = off).
+/// Build-time override for tuning: SHOP_PF_DIST.
+const PF_DIST: usize = match option_env!("SHOP_PF_DIST") {
+    Some(s) => parse_usize(s),
+    None => 0,
+};
+
+#[inline(always)]
+fn prefetch_read(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8);
+    }
+}
+
 /// Bytes indexed per batch (a batch is then extended to the next newline).
-const BATCH: usize = 64 << 10;
+/// Build-time override for tuning: SHOP_BATCH_KB.
+const BATCH: usize = (match option_env!("SHOP_BATCH_KB") {
+    Some(s) => parse_usize(s),
+    None => 64,
+}) << 10;
+
+const fn parse_usize(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut v = 0;
+    while i < b.len() {
+        v = v * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    v
+}
 
 /// Call `f` with the `N` unquoted fields of every well-formed line of `data`,
 /// in order: the same lines and fields as `csv::for_lines` + `csv::split`.
