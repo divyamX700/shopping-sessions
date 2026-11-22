@@ -1,0 +1,47 @@
+name: sys
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sys:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          nproc; lscpu | grep "Model name"
+          sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) strace >/dev/null 2>&1 || sudo apt-get install -y -q linux-tools-azure strace >/dev/null 2>&1 || true
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" cargo build --release -q
+          git clone -q https://github.com/loveconnor/larp-shopping-sessions-v5 /tmp/larp
+          (cd /tmp/larp/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" | tail -1
+      - name: Time
+        run: |
+          O=./target/release/shopping; L=/tmp/larp/native/target/release/shopping-sessions
+          for r in 1 2 3; do
+            /usr/bin/time -f "larp %e s faults %R rss %M sys %S user %U" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=8 $L 2>&1 | tail -1
+            /usr/bin/time -f "ours %e s faults %R rss %M sys %S user %U" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=8 SHOP_PREAD=1 $O 2>&1 | tail -1
+            /usr/bin/time -f "ours-mmap %e s faults %R rss %M sys %S user %U" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=8 $O 2>&1 | tail -1
+            /usr/bin/time -f "ours-nohuge %e s faults %R rss %M sys %S user %U" env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=8 SHOP_PREAD=1 SHOP_NOHUGE=1 $O 2>&1 | tail -1
+          done
+      - name: Strace
+        run: |
+          O=./target/release/shopping; L=/tmp/larp/native/target/release/shopping-sessions
+          strace -f -c -o /tmp/sl.txt env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=8 $L >/dev/null 2>&1; echo LARP; head -25 /tmp/sl.txt
+          strace -f -c -o /tmp/so.txt env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=8 SHOP_PREAD=1 $O >/dev/null 2>&1; echo OURS; head -25 /tmp/so.txt
+      - name: Kernel perf
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
+          O=./target/release/shopping; L=/tmp/larp/native/target/release/shopping-sessions
+          for who in ours larp; do
+            if [ $who = ours ]; then B="env SHOP_PREAD=1 $O"; else B=$L; fi
+            DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=8 perf record -F 2999 -g -o $who.data $B 2>&1 | tail -1
+            echo "==== $who top symbols (all)"
+            perf report -i $who.data --stdio --no-children --sort symbol --percent-limit 0.8 2>/dev/null | grep -E "^ +[0-9]" | head -35
+          done
