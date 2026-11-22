@@ -459,7 +459,7 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, aliases: &Aliases, out: &mut Sink<PCl>
     let Some(camp) = ctx.campaigns.get(f[2]) else { return };
     let ukey = keys::key(f[1], b'u');
     let h = mix(ukey);
-    let person = aliases.person(ukey, h);
+    let person = aliases.person_filtered(ukey, h);
     let ph = if person == ukey { h } else { mix(person) };
     out.push(part(ph, Q_BITS), PCl { person, ckey: keys::key(f[0], b'k'), ts: (t - ctx.cws) as u32, camp });
 }
@@ -471,6 +471,10 @@ struct Aliases {
     /// pages, so the random probes do not also miss the TLB.
     slots: &'static mut [[u64; 2]],
     mask: usize,
+    /// One bit per hash of a linked ID: most lookups during the click parse
+    /// (IDs that are their own person) stop here, without touching `slots`.
+    filter: &'static mut [u64],
+    fmask: u64,
 }
 
 /// A zero-filled array on transparent huge pages (leaked: freed at exit).
@@ -492,6 +496,13 @@ impl Aliases {
             s[0] = EMPTY;
         }
         let mask = cap - 1;
+        let fbits = (pairs.len() * 16).next_power_of_two().max(1 << 12);
+        let filter = huge_slice::<u64>(fbits / 64);
+        let fmask = fbits as u64 - 1;
+        for &(k, _) in pairs {
+            let f = (mix(k) >> 20) & fmask;
+            filter[(f >> 6) as usize] |= 1 << (f & 63);
+        }
         for &(k, v) in pairs {
             let mut s = mix(k) as usize & mask;
             while slots[s][0] != EMPTY && slots[s][0] != k {
@@ -499,7 +510,7 @@ impl Aliases {
             }
             slots[s] = [k, v];
         }
-        Aliases { slots, mask }
+        Aliases { slots, mask, filter, fmask }
     }
     /// `h` is mix(k).
     #[inline(always)]
@@ -519,6 +530,15 @@ impl Aliases {
     #[inline(always)]
     fn prefetch(&self, h: u64) {
         prefetch(unsafe { self.slots.as_ptr().add(h as usize & self.mask) });
+    }
+    /// `person` behind the filter (for lookups that cannot be prefetched).
+    #[inline(always)]
+    fn person_filtered(&self, k: u64, h: u64) -> u64 {
+        let f = (h >> 20) & self.fmask;
+        if unsafe { *self.filter.get_unchecked((f >> 6) as usize) } & (1 << (f & 63)) == 0 {
+            return k;
+        }
+        self.person(k, h)
     }
 }
 
@@ -773,6 +793,43 @@ struct P3 {
     acc: Vec<[i64; 4]>,
     rows: UserRows,
     prof: [f64; 4],
+    ra: Vec<(u64, u32)>,
+    rb: Vec<(u64, u32)>,
+    ca: Vec<(u64, C3)>,
+    cb: Vec<(u64, C3)>,
+}
+
+/// Stable LSD radix sort on bits 32..63 of the key (three passes of 11, 11
+/// and 10 bits): a whole partition in time order in three linear passes.
+fn radix_ts<T: Copy>(a: &mut Vec<(u64, T)>, b: &mut Vec<(u64, T)>) {
+    let n = a.len();
+    if n < 2 {
+        return;
+    }
+    let mut h = [[0u32; 2048]; 3];
+    for x in a.iter() {
+        h[0][(x.0 >> 32) as usize & 2047] += 1;
+        h[1][(x.0 >> 43) as usize & 2047] += 1;
+        h[2][(x.0 >> 54) as usize & 2047] += 1;
+    }
+    b.clear();
+    b.reserve(n);
+    unsafe { b.set_len(n) };
+    for (pass, shift) in [32u32, 43, 54].into_iter().enumerate() {
+        let c = &mut h[pass];
+        let mut sum = 0u32;
+        for x in c.iter_mut() {
+            let v = *x;
+            *x = sum;
+            sum += v;
+        }
+        for x in a.iter() {
+            let slot = &mut c[(x.0 >> shift) as usize & 2047];
+            unsafe { *b.get_unchecked_mut(*slot as usize) = *x };
+            *slot += 1;
+        }
+        std::mem::swap(a, b);
+    }
 }
 
 impl P3 {
@@ -888,12 +945,18 @@ impl P3 {
             }
             let di = (day - ctx.day0) as usize;
             let credited = if hi > lo {
+                // Latest click; on equal ts the smallest click_id (clicks are
+                // in time order, not id order, within a timestamp).
                 let t = self.cls[hi - 1].ts;
                 let mut m = hi - 1;
+                let mut best = m;
                 while m > lo && self.cls[m - 1].ts == t {
                     m -= 1;
+                    if keys::cmp(self.cls[m].ckey, self.cls[best].ckey, b'k') == std::cmp::Ordering::Less {
+                        best = m;
+                    }
                 }
-                self.cls[m].camp as usize
+                self.cls[best].camp as usize
             } else {
                 organic
             };
@@ -1323,6 +1386,10 @@ fn main() {
             acc: vec![[0; 4]; (ncamp + 1) * ctx.ndays],
             rows: UserRows::default(),
             prof: [0.0; 4],
+            ra: Vec::new(),
+            rb: Vec::new(),
+            ca: Vec::new(),
+            cb: Vec::new(),
         },
         |st, t| {
             let q = order[t];
@@ -1356,18 +1423,27 @@ fn main() {
                 run += x;
             }
             st.eoff.push(run);
+            // Time order first (radix), then a stable scatter by person:
+            // every person's events end up sorted without per-person sorts.
+            st.ra.clear();
+            {
+                let mut k = 0;
+                for w in &p2 {
+                    for e in w.pe.slices(q).flatten() {
+                        st.ra.push((e.w, st.eidx[k]));
+                        k += 1;
+                    }
+                }
+            }
+            radix_ts(&mut st.ra, &mut st.rb);
             st.evs.clear();
             st.evs.resize(ne, 0);
             {
                 let mut cursor: Vec<u32> = st.eoff[..np].to_vec();
-                let mut k = 0;
-                for w in &p2 {
-                    for e in w.pe.slices(q).flatten() {
-                        let i = st.eidx[k] as usize;
-                        k += 1;
-                        st.evs[cursor[i] as usize] = e.w;
-                        cursor[i] += 1;
-                    }
+                for &(w, i) in &st.ra {
+                    let c = &mut cursor[i as usize];
+                    st.evs[*c as usize] = w;
+                    *c += 1;
                 }
             }
             // Clicks of persons that have events.
@@ -1396,19 +1472,26 @@ fn main() {
             st.coff[np] = run;
             st.cls.clear();
             st.cls.resize(nc, C3::default());
+            st.ca.clear();
             {
-                let mut cursor: Vec<u32> = st.coff[..np].to_vec();
                 let mut k = 0;
                 for w in &p1 {
                     for c in w.pc.slices(q).flatten() {
                         let i = st.eidx[k];
                         k += 1;
                         if i != NONE {
-                            let i = i as usize;
-                            st.cls[cursor[i] as usize] = C3 { ckey: c.ckey, ts: c.ts, camp: c.camp };
-                            cursor[i] += 1;
+                            st.ca.push(((c.ts as u64) << 32 | i as u64, C3 { ckey: c.ckey, ts: c.ts, camp: c.camp }));
                         }
                     }
+                }
+            }
+            radix_ts(&mut st.ca, &mut st.cb);
+            {
+                let mut cursor: Vec<u32> = st.coff[..np].to_vec();
+                for &(key, c3) in &st.ca {
+                    let c = &mut cursor[(key & 0xFFFF_FFFF) as usize];
+                    st.cls[*c as usize] = c3;
+                    *c += 1;
                 }
             }
             st.prof[0] += tt.elapsed().as_secs_f64();
@@ -1416,10 +1499,6 @@ fn main() {
             for p in 0..np {
                 let (e_lo, e_hi) = (st.eoff[p] as usize, st.eoff[p + 1] as usize);
                 let (c_lo, c_hi) = (st.coff[p] as usize, st.coff[p + 1] as usize);
-                st.evs[e_lo..e_hi].sort_unstable();
-                if c_hi - c_lo > 1 {
-                    st.cls[c_lo..c_hi].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::cmp(a.ckey, b.ckey, b'k')));
-                }
                 let person = st.persons[p];
                 st.person(&ctx, person, e_lo, e_hi, c_lo, c_hi);
             }
