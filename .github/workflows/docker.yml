@@ -47,7 +47,7 @@ jobs:
               sudo rm -rf $out
             done
           done
-          tail -3 /tmp/err_ours.txt /tmp/err_larp.txt
+          tail -n 3 /tmp/err_ours.txt /tmp/err_larp.txt || true
           python3 - <<'EOF'
           import collections, statistics
           d = collections.defaultdict(list)
@@ -60,9 +60,10 @@ jobs:
       - name: Direct binary inside image vs host build
         run: |
           id=$(docker create ours); docker cp $id:/shopping /tmp/ours-img; docker rm $id >/dev/null
+          id=$(docker create larp); docker cp $id:/app/shopping-sessions /tmp/larp-img; docker rm $id >/dev/null
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
-          for r in 1 2 3; do
-            for b in /tmp/ours-img ./target/release/shopping; do
+          for r in 1 2 3 4; do
+            for b in /tmp/larp-img /tmp/ours-img ./target/release/shopping; do
               out=$(mktemp -d); s=$(date +%s.%N)
               env DATA_DIR=/mnt/data/p20 OUTPUT_DIR=$out NCPU=8 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_POPULATE=1 $b >/dev/null 2>&1
               e=$(date +%s.%N); echo "$b $(python3 -c "print(round($e-$s,4))")"; rm -rf $out
