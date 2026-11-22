@@ -274,6 +274,21 @@ fn pread_aligned() -> bool {
     *A.get_or_init(|| std::env::var_os("SHOP_PREAD_UNALIGNED").is_none())
 }
 
+/// Map the pages of raw range [a, b) (plus the next page for the last line)
+/// in one call (MADV_POPULATE_READ): no per-page faults, no copy.
+fn populate(m: &Mmap, a: usize, b: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        }
+        let base = m.as_ptr() as usize;
+        let from = (base + a.saturating_sub(1)) & !4095;
+        let to = (base + (b + 4096).min(m.len()) + 4095) & !4095;
+        madvise(from as *mut u8, to - from, 22);
+    }
+}
+
 /// The lines of raw range [a, b) of a mapped file.
 fn map_chunk(m: &[u8], a: usize, b: usize) -> &[u8] {
     let (s, e) = line_span(m, 0, a, b, m.len()).expect("whole file");
@@ -1495,11 +1510,13 @@ fn main() {
 
     // Phase 1: parse.
     let aliases_cell: std::sync::OnceLock<Aliases> = std::sync::OnceLock::new();
+    let populate_in = std::env::var_os("SHOP_POPULATE").is_some();
+    let old_scan = std::env::var_os("SHOP_OLDSCAN").is_some();
     let p1 = thread::scope(|scope| {
         #[cfg(unix)]
         {
             let all: Vec<&Mmap> = event_files.iter().chain(click_files.iter()).collect();
-            if map_input && std::env::var_os("SHOP_NORA").is_none() {
+            if map_input && !populate_in && std::env::var_os("SHOP_NORA").is_none() {
                 scope.spawn(move || readahead_all(&all));
             }
         }
@@ -1529,22 +1546,22 @@ fn main() {
                     let slice: &[u8] = if pread_input {
                         read_chunk(&event_fds[fi], a, b, event_lens[fi], &mut st.rbuf)
                     } else {
-                        map_chunk(&event_files[fi], a, b)
+                        { if populate_in { populate(&event_files[fi], a, b) } map_chunk(&event_files[fi], a, b) }
                     };
                     let slice: &[u8] = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
                     let (idx, ev, tsc) = (&mut st.idx, &mut st.ev, &mut st.tsc);
-                    if std::env::var_os("SHOP_OLDSCAN").is_some() { index::scan_indexed::<7>(slice, idx, |f| parse_event(f, &ctx, ev, tsc)); } else { scan::lines::<7>(slice, |f| parse_event(f, &ctx, ev, tsc)); }
+                    if old_scan { index::scan_indexed::<7>(slice, idx, |f| parse_event(f, &ctx, ev, tsc)); } else { scan::lines::<7>(slice, |f| parse_event(f, &ctx, ev, tsc)); }
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
                     let slice: &[u8] = if pread_input {
                         read_chunk(&click_fds[fi], a, b, click_lens[fi], &mut st.rbuf)
                     } else {
-                        map_chunk(&click_files[fi], a, b)
+                        { if populate_in { populate(&click_files[fi], a, b) } map_chunk(&click_files[fi], a, b) }
                     };
                     let slice: &[u8] = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
                     let aliases = aliases_cell.wait();
                     let (idx, pc, tsc) = (&mut st.idx, &mut st.pc, &mut st.tsc);
-                    if std::env::var_os("SHOP_OLDSCAN").is_some() { index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc)); } else { scan::lines::<4>(slice, |f| parse_click(f, &ctx, aliases, pc, tsc)); }
+                    if old_scan { index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc)); } else { scan::lines::<4>(slice, |f| parse_click(f, &ctx, aliases, pc, tsc)); }
                 }
                 if release_input && map_input {
                     let slice = if t < n_event_chunks {
