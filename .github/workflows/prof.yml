@@ -23,11 +23,11 @@ jobs:
         run: |
           for i in 1 2; do SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast|cpu|general"; done
           for m in 2 1; do echo "scanonly $m"; FAST_SCANONLY=$m SHOP_PROFILE=1 SHOP_NOFAST=0 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 30 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done
-          for k in 8 1 2 4 3 6 7; do echo "FAST_K=$k"; FAST_K=$k SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 40 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done
+          for k in 8 1 2 4 7; do echo "FAST_K=$k"; FAST_K=$k SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 40 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done
+          for k in 8 1 2 4 7; do echo "FAST_K=$k threads=$(nproc)"; FAST_K=$k SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) timeout 40 ./target/release/shopping 2>&1 | grep -E "parse cpu: links|fast: parse" | head -2; done
       - name: Perf
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null
-          for m in "FAST_SCANONLY=1" "FAST_K=8" "FAST_K=7"; do echo "== stat $m (1 thread)"; env $m DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 perf stat -e instructions,cycles,branch-misses,L1-dcache-load-misses ./target/release/shopping 2>&1 | grep -E "instructions|cycles|branch-misses|L1-dcache" ; done
           DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) perf record -F 4999 -g -o perf.data ./target/release/shopping 2>&1 | tail -2
           perf report -i perf.data --stdio --no-children --sort symbol --percent-limit 0.7 2>/dev/null | grep -E "^ +[0-9]" | head -45
           echo "---- by srcline (top)"
