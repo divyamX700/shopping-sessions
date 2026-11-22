@@ -886,6 +886,7 @@ struct P3 {
     rb: Vec<(u64, u32)>,
     /// Dense person id of each event, in input order (scatter grouping).
     loc: Vec<u32>,
+    scr: Vec<u64>,
     /// The person whose name was written last, and where (in rows.names).
     name_of: u64,
     name_at: (usize, usize),
@@ -895,6 +896,42 @@ struct P3 {
 
 /// Stable LSD radix sort on bits 32..63 of the key (three passes of 11, 11
 /// and 10 bits): a whole partition in time order in three linear passes.
+/// Sort a long run of event values by time (bits 32..63): three stable
+/// counting passes of 11 bits. Equal times keep input order (any order of
+/// equal-time events gives the same output).
+fn radix_by_ts(s: &mut [u64], scratch: &mut Vec<u64>) {
+    scratch.clear();
+    scratch.resize(s.len(), 0);
+    let mut h = [[0u32; 2048]; 3];
+    for &v in s.iter() {
+        h[0][(v >> 32) as usize & 2047] += 1;
+        h[1][(v >> 43) as usize & 2047] += 1;
+        h[2][(v >> 54) as usize & 2047] += 1;
+    }
+    let mut in_s = true;
+    for (pass, shift) in [32u32, 43, 54].into_iter().enumerate() {
+        let c = &mut h[pass];
+        let mut sum = 0u32;
+        for x in c.iter_mut() {
+            let v = *x;
+            *x = sum;
+            sum += v;
+        }
+        let (from, to): (&[u64], &mut [u64]) = if in_s { (&*s, &mut scratch[..]) } else { (&scratch[..], &mut *s) };
+        // Split borrows: copy the source pointer to satisfy the borrow checker.
+        let from: &[u64] = unsafe { std::slice::from_raw_parts(from.as_ptr(), from.len()) };
+        for &v in from {
+            let slot = &mut c[(v >> shift) as usize & 2047];
+            unsafe { *to.get_unchecked_mut(*slot as usize) = v };
+            *slot += 1;
+        }
+        in_s = !in_s;
+    }
+    if !in_s {
+        s.copy_from_slice(scratch);
+    }
+}
+
 #[inline]
 fn insertion_sort(s: &mut [u64]) {
     for i in 1..s.len() {
@@ -1771,6 +1808,7 @@ fn main() {
             ra: Vec::new(),
             rb: Vec::new(),
             loc: Vec::new(),
+            scr: Vec::new(),
             name_of: EMPTY,
             name_at: (0, 0),
             ca: Vec::new(),
@@ -1849,8 +1887,12 @@ fn main() {
                     if !s.is_sorted() {
                         if s.len() <= 24 {
                             insertion_sort(s);
-                        } else {
+                        } else if s.len() <= 2048 {
                             s.sort_unstable();
+                        } else {
+                            // Whales (up to ~1M events): linear-time sort, so
+                            // one partition does not become the phase's tail.
+                            radix_by_ts(s, &mut st.scr);
                         }
                     }
                 }
