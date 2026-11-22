@@ -11,8 +11,14 @@
 use crate::csv::{masks, split};
 
 #[inline(always)]
-fn block(data: &[u8], at: usize) -> (u64, u64, u64) {
+fn block<const W: bool>(data: &[u8], at: usize) -> (u64, u64, u64) {
     if at + 64 <= data.len() {
+        if W {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                return masks512(data.as_ptr().add(at));
+            }
+        }
         masks(data[at..at + 64].try_into().unwrap())
     } else if at < data.len() {
         let mut t = [0u8; 64];
@@ -21,6 +27,19 @@ fn block(data: &[u8], at: usize) -> (u64, u64, u64) {
     } else {
         (0, 0, 0)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn masks512(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p as *const _);
+    (
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+    )
 }
 
 /// The 128 mask bits starting at bit `o` (< 64) of the three words.
@@ -34,61 +53,92 @@ fn view(w0: u64, w1: u64, w2: u64, o: u32) -> u128 {
     }
 }
 
+static AVX512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn has_avx512() -> bool {
+    *AVX512.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::env::var_os("FAST_NO512").is_none()
+                && std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        false
+    })
+}
+
 /// Calls `f` with the N unquoted fields of every well-formed line of `data`
 /// (same lines and fields as `csv::for_lines` + `csv::split`).
 #[inline(always)]
-pub fn lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+pub fn lines<'a, const N: usize>(data: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512() {
+        unsafe { lines512::<N>(data, f) };
+        return;
+    }
+    lines_impl::<N, false>(data, f)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn lines512<'a, const N: usize>(data: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
+    lines_impl::<N, true>(data, f)
+}
+
+#[inline(always)]
+fn lines_impl<'a, const N: usize, const W: bool>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = data.len();
     let mut base = 0usize;
     let mut o = 0usize;
-    let (mut n0, mut c0, mut q0) = block(data, 0);
-    let (mut n1, mut c1, mut q1) = block(data, 64);
-    let (mut n2, mut c2, mut q2) = block(data, 128);
+    let (mut n0, mut c0, mut q0) = block::<W>(data, 0);
+    let (mut n1, mut c1, mut q1) = block::<W>(data, 64);
+    let (mut n2, mut c2, mut q2) = block::<W>(data, 128);
     while base + o < len {
         let start = base + o;
         let nl = view(n0, n1, n2, o as u32);
         let l;
         if nl != 0 {
             l = nl.trailing_zeros() as usize;
-            if start + l > len {
-                // Text after the last newline (the tail is zero padded).
-                let mut out: [&'a [u8]; N] = [&[]; N];
-                if split(&data[start..], &mut out) {
-                    f(&out);
-                }
-                return;
-            }
             let keep = (1u128 << l) - 1;
             let cm = view(c0, c1, c2, o as u32) & keep;
             let qm = view(q0, q1, q2, o as u32) & keep;
             if l > 0 && cm.count_ones() as usize == N - 1 {
-                let mut out: [&'a [u8]; N] = [&[]; N];
-                let mut s = 0usize;
-                let mut m = cm;
-                let mut wrapped = 0u32;
-                // SAFETY: every index read is in [start, start + l], and
-                // data[start + l] is the line's newline.
-                let p = unsafe { data.as_ptr().add(start) };
-                for (k, slot) in out.iter_mut().enumerate() {
-                    let e = if k + 1 < N {
-                        let t = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        t
-                    } else {
-                        l
-                    };
-                    let (c0, c1) = unsafe { (*p.add(s), *p.add(e.max(s + 1) - 1)) };
-                    let w = ((e >= s + 2) as usize) & ((c0 == b'"') as usize) & ((c1 == b'"') as usize);
-                    wrapped += w as u32;
-                    *slot = unsafe { std::slice::from_raw_parts(p.add(s + w), e - s - 2 * w) };
-                    s = e + 1;
-                }
-                if qm.count_ones() == 2 * wrapped {
+                // Separators (commas and the line end), field starts, and the
+                // last byte of every non-empty field.
+                let sep = cm | (1u128 << l);
+                let body = !sep & keep;
+                let starts = (sep << 1 | 1) & body;
+                let lasts = (sep >> 1) & body;
+                let qs = qm & starts;
+                let qe = qm & lasts;
+                // An opening quote carried along its field lands on the field's
+                // separator; it must meet a closing quote right before it.
+                let open = body.wrapping_add(qs) & sep;
+                let ok = qm == qs | qe && qs & qe == 0 && open == qe << 1;
+                if ok {
+                    let mut out: [&'a [u8]; N] = [&[]; N];
+                    let mut s = 0usize;
+                    let mut m = cm;
+                    // SAFETY: fields lie inside data[start..start + l].
+                    let p = unsafe { data.as_ptr().add(start) };
+                    for (k, slot) in out.iter_mut().enumerate() {
+                        let e = if k + 1 < N {
+                            let t = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            t
+                        } else {
+                            l
+                        };
+                        let w = ((qs >> s) as u64 & 1) as usize;
+                        *slot = unsafe { std::slice::from_raw_parts(p.add(s + w), e - s - 2 * w) };
+                        s = e + 1;
+                    }
                     f(&out);
                 }
             }
         } else {
-            // A line of 128 bytes or more.
+            // A line of 128 bytes or more, or the text after the last newline.
             l = match memchr::memchr(b'\n', &data[start..]) {
                 Some(i) => i,
                 None => len - start,
@@ -103,11 +153,11 @@ pub fn lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N
         if nb == base + 64 {
             (n0, c0, q0) = (n1, c1, q1);
             (n1, c1, q1) = (n2, c2, q2);
-            (n2, c2, q2) = block(data, nb + 128);
+            (n2, c2, q2) = block::<W>(data, nb + 128);
         } else if nb != base {
-            (n0, c0, q0) = block(data, nb);
-            (n1, c1, q1) = block(data, nb + 64);
-            (n2, c2, q2) = block(data, nb + 128);
+            (n0, c0, q0) = block::<W>(data, nb);
+            (n1, c1, q1) = block::<W>(data, nb + 64);
+            (n2, c2, q2) = block::<W>(data, nb + 128);
         }
         base = nb;
         o = next - nb;

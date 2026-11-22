@@ -33,6 +33,9 @@ jobs:
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
           pip install --quiet polars
 
+      - name: Unit tests (scanner fuzz runs the AVX-512 path where the runner has it)
+        run: RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release -q 2>&1 | tail -3
+
       - name: Fixtures (fast path on, and the general pipeline alone)
         run: |
           python3 scripts/run_fixtures.py fixtures -- "$PWD/target/release/shopping" | tail -2
