@@ -784,9 +784,9 @@ impl SmallIndex {
     fn get_or_insert(&mut self, k: u64, next: u32) -> (u32, bool) {
         let mut s = mix(k) as usize & self.mask;
         loop {
-            let x = self.keys[s];
+            let x = unsafe { *self.keys.get_unchecked(s) }; // s <= mask
             if x == k {
-                return (self.vals[s], false);
+                return (unsafe { *self.vals.get_unchecked(s) }, false);
             }
             if x == EMPTY {
                 self.keys[s] = k;
@@ -804,9 +804,9 @@ impl SmallIndex {
     fn get(&self, k: u64) -> Option<u32> {
         let mut s = mix(k) as usize & self.mask;
         loop {
-            let x = self.keys[s];
+            let x = unsafe { *self.keys.get_unchecked(s) }; // s <= mask
             if x == k {
-                return Some(self.vals[s]);
+                return Some(unsafe { *self.vals.get_unchecked(s) });
             }
             if x == EMPTY {
                 return None;
@@ -1695,11 +1695,17 @@ fn main() {
             st.coll.clear();
             st.coll.resize(bits / 64, 0);
             for w in &p1 {
-                for e in w.ev.slices(t).flatten() {
-                    let f = mix(e.ekey) & fmask;
-                    let (word, bit) = ((f >> 6) as usize, 1u64 << (f & 63));
-                    st.coll[word] |= st.seen[word] & bit;
-                    st.seen[word] |= bit;
+                for sl in w.ev.slices(t) {
+                    for e in sl {
+                        let f = mix(e.ekey) & fmask;
+                        let (word, bit) = ((f >> 6) as usize, 1u64 << (f & 63));
+                        // word < bits / 64 = seen.len() = coll.len() (f <= fmask).
+                        unsafe {
+                            let s = *st.seen.get_unchecked(word);
+                            *st.coll.get_unchecked_mut(word) |= s & bit;
+                            *st.seen.get_unchecked_mut(word) = s | bit;
+                        }
+                    }
                 }
             }
             st.prof[0] += tt.elapsed().as_secs_f64();
@@ -1836,17 +1842,20 @@ fn main() {
                 st.loc.reserve(ne);
             }
             for w in &p2 {
-                for e in w.pe.slices(q).flatten() {
-                    let (i, new) = st.index.get_or_insert(e.person, st.persons.len() as u32);
-                    if new {
-                        st.persons.push(e.person);
-                        st.eoff.push(0);
-                    }
-                    st.eoff[i as usize] += 1;
-                    if radix_group {
-                        st.ra.push((e.w, i));
-                    } else {
-                        st.loc.push(i);
+                for sl in w.pe.slices(q) {
+                    for e in sl {
+                        let (i, new) = st.index.get_or_insert(e.person, st.persons.len() as u32);
+                        if new {
+                            st.persons.push(e.person);
+                            st.eoff.push(0);
+                        }
+                        // i < persons.len() = eoff.len().
+                        unsafe { *st.eoff.get_unchecked_mut(i as usize) += 1 };
+                        if radix_group {
+                            st.ra.push((e.w, i));
+                        } else {
+                            st.loc.push(i);
+                        }
                     }
                 }
             }
@@ -1877,11 +1886,13 @@ fn main() {
                 let mut cursor: Vec<u32> = st.eoff[..np].to_vec();
                 let mut k = 0usize;
                 for w in &p2 {
-                    for e in w.pe.slices(q).flatten() {
-                        let c = unsafe { cursor.get_unchecked_mut(*st.loc.get_unchecked(k) as usize) };
-                        unsafe { *st.evs.get_unchecked_mut(*c as usize) = e.w };
-                        *c += 1;
-                        k += 1;
+                    for sl in w.pe.slices(q) {
+                        for e in sl {
+                            let c = unsafe { cursor.get_unchecked_mut(*st.loc.get_unchecked(k) as usize) };
+                            unsafe { *st.evs.get_unchecked_mut(*c as usize) = e.w };
+                            *c += 1;
+                            k += 1;
+                        }
                     }
                 }
                 for p in 0..np {
@@ -1905,14 +1916,17 @@ fn main() {
             st.eidx.clear();
             let mut nc = 0usize;
             for w in &p1 {
-                for c in w.pc.slices(q).flatten() {
-                    match st.index.get(c.person) {
-                        Some(i) => {
-                            st.coff[i as usize] += 1;
-                            st.eidx.push(i);
-                            nc += 1;
+                for sl in w.pc.slices(q) {
+                    for c in sl {
+                        match st.index.get(c.person) {
+                            Some(i) => {
+                                // i < np < coff.len().
+                                unsafe { *st.coff.get_unchecked_mut(i as usize) += 1 };
+                                st.eidx.push(i);
+                                nc += 1;
+                            }
+                            None => st.eidx.push(NONE),
                         }
-                        None => st.eidx.push(NONE),
                     }
                 }
             }
