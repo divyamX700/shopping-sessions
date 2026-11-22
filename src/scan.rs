@@ -54,6 +54,8 @@ fn view(w0: u64, w1: u64, w2: u64, o: u32) -> u128 {
 }
 
 static AVX512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Comma positions by PDEP (FAST_PDEP=1) instead of a tzcnt chain.
+pub static PDEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn has_avx512() -> bool {
     *AVX512.get_or_init(|| {
@@ -122,11 +124,30 @@ fn lines_impl<'a, const N: usize, const W: bool>(data: &'a [u8], mut f: impl FnM
                     let mut m = cm;
                     // SAFETY: fields lie inside data[start..start + l].
                     let p = unsafe { data.as_ptr().add(start) };
+                    // Comma positions, each found independently (k-th set bit).
+                    let mut pos = [0usize; 8];
+                    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                    if PDEP.load(std::sync::atomic::Ordering::Relaxed) {
+                        use std::arch::x86_64::_pdep_u64;
+                        let (lo, hi) = (cm as u64, (cm >> 64) as u64);
+                        let nlo = lo.count_ones() as usize;
+                        for (k, q) in pos.iter_mut().enumerate().take(N - 1) {
+                            let a = unsafe { _pdep_u64(1u64 << (k & 63), lo) }.trailing_zeros() as usize;
+                            let b = 64 + unsafe { _pdep_u64(1u64 << (k.wrapping_sub(nlo) & 63), hi) }.trailing_zeros() as usize;
+                            *q = if k < nlo { a } else { b };
+                        }
+                        m = 0;
+                    }
+                    let use_pos = m == 0 && N > 1;
                     for (k, slot) in out.iter_mut().enumerate() {
                         let e = if k + 1 < N {
-                            let t = m.trailing_zeros() as usize;
-                            m &= m - 1;
-                            t
+                            if use_pos {
+                                pos[k]
+                            } else {
+                                let t = m.trailing_zeros() as usize;
+                                m &= m - 1;
+                                t
+                            }
                         } else {
                             l
                         };
@@ -284,6 +305,14 @@ mod tests {
 
     #[test]
     fn lines_match_split() {
+        for pd in [false, true] {
+            PDEP.store(pd, std::sync::atomic::Ordering::Relaxed);
+            lines_match_split_once();
+        }
+        PDEP.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn lines_match_split_once() {
         let alphabet = b"ab,,,\"\"\"\n\n\r 1x";
         let mut st = 0x1234_5678_9abc_def0u64;
         let mut next = || {
