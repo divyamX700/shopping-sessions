@@ -1572,11 +1572,13 @@ fn main() {
     lap("parse-joined");
     // The long-ID check runs alongside phase 2, which only needs the keys;
     // its answer is needed before phase 3 (output and click-key ties).
+    let verify_bg = std::env::var_os("SHOP_VERIFY_BG").is_some();
     let verify = {
-        let vt = (threads / 2).max(1);
-        std::thread::spawn(move || keys::verify_longs(vt))
+        let vt = if verify_bg { (threads / 2).max(1) } else { threads };
+        Some(std::thread::spawn(move || keys::verify_longs(vt)))
     };
-    let finish_verify = |verify: std::thread::JoinHandle<bool>| {
+    let finish_verify = |verify: Option<std::thread::JoinHandle<bool>>| {
+        let Some(verify) = verify else { return };
         if !verify.join().unwrap_or(false) {
             if profile {
                 eprintln!("long IDs: key collision or undecided comparison -> exact re-run");
@@ -1589,6 +1591,7 @@ fn main() {
             std::process::exit(status.code().unwrap_or(1));
         }
     };
+    let verify = if verify_bg { verify } else { finish_verify(verify); None };
     if profile {
         let ev: f64 = p1.iter().map(|w| w.prof[0]).sum();
         let cl: f64 = p1.iter().map(|w| w.prof[1]).sum();
