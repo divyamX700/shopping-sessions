@@ -27,7 +27,7 @@ jobs:
           mkdir -p /tmp/bins
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q && cp target/release/shopping /tmp/bins/base
           for b in $BUILDS; do
-            h=$(echo "$b" | md5sum | cut -c1-8); env $b RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q --target-dir /tmp/t$h 2>&1 | grep -E "^error" -A5; cp /tmp/t$h/release/shopping "/tmp/bins/$b"; ls -la "/tmp/bins/$b"
+            h=$(echo "$b" | md5sum | cut -c1-8); env $b RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q --target-dir /tmp/t$h 2>&1 | grep -E "^error" -A5 || true; cp /tmp/t$h/release/shopping "/tmp/bins/$b"; ls -la "/tmp/bins/$b"
           done
           git clone -q https://github.com/loveconnor/larp-shopping-sessions-v5 /tmp/larp
           (cd /tmp/larp/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
