@@ -1,0 +1,59 @@
+name: bknobs
+
+on:
+  workflow_dispatch:
+    inputs:
+      builds:
+        description: "space-separated build-time env assignments, each its own binary (vs default build)"
+        default: "SHOP_P_BITS=10 SHOP_CHUNK_KB=256 SHOP_CHUNK_KB=1024"
+      rounds:
+        default: "6"
+
+permissions:
+  contents: read
+
+jobs:
+  bknobs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          BUILDS: ${{ inputs.builds }}
+        run: |
+          nproc; lscpu | grep -E "Model name"
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          mkdir -p /tmp/bins
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q && cp target/release/shopping /tmp/bins/base
+          for b in $BUILDS; do
+            env $b RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q --target-dir /tmp/t_$b && cp /tmp/t_$b/release/shopping "/tmp/bins/$b"
+          done
+          git clone -q https://github.com/loveconnor/larp-shopping-sessions-v5 /tmp/larp
+          (cd /tmp/larp/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" | tail -1
+      - name: A/B
+        env:
+          BUILDS: ${{ inputs.builds }}
+          ROUNDS: ${{ inputs.rounds }}
+        run: |
+          L=/tmp/larp/native/target/release/shopping-sessions; N=$(nproc)
+          : > /tmp/t.txt
+          for r in $(seq 1 $ROUNDS); do
+            for v in LARP base $BUILDS; do
+              out=$(mktemp -d); s=$(date +%s.%N)
+              if [ $v = LARP ]; then env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$out NCPU=$N $L >/dev/null 2>&1
+              else env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$out NCPU=$N MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_PREAD=1 "/tmp/bins/$v" >/dev/null 2>&1; fi
+              e=$(date +%s.%N); echo "$v $(python3 -c "print(round($e-$s,4))")" | tee -a /tmp/t.txt; rm -rf $out
+            done
+          done
+          echo "==== medians"
+          python3 - <<'EOF'
+          import collections, statistics
+          d = collections.defaultdict(list)
+          for line in open("/tmp/t.txt"):
+              k, v = line.split()
+              d[k].append(float(v))
+          for k, v in d.items():
+              print(f"{k:40s} median {statistics.median(v):.3f}  min {min(v):.3f}  n {len(v)}")
+          EOF
