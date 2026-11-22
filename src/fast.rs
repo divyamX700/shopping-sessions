@@ -21,7 +21,7 @@ use std::time::Instant;
 use memmap2::Mmap;
 
 use crate::sink::{Region, Sink};
-use crate::{body, chunks, csv, index, list_csv, map_files, out, pool_finish, ts, Ctx};
+use crate::{body, chunks, csv, index, list_csv, map_files, out, pool_finish, scan, ts, Ctx};
 
 const M40: u64 = (1 << 40) - 1;
 const MA: u64 = 0x9E37_79B9_7F4B;
@@ -283,6 +283,20 @@ impl Shared {
             return None;
         }
         let v = dec(unx(b36(&s[1..])?, self.binv), self.uk, self.ainv);
+        if v >= 1 << 39 {
+            return None;
+        }
+        let p = (v >> 9) as usize;
+        (p < self.p_cap).then_some((p, (v & 511) as u32))
+    }
+    /// `user` for a field inside a mapping that ends at `end`.
+    #[inline(always)]
+    fn user_at(&self, s: &[u8], end: *const u8) -> Option<(usize, u32)> {
+        if s.len() < 2 || s[0] != b'u' {
+            return None;
+        }
+        let r = &s[1..];
+        let v = dec(unx(scan::b36(r, scan::load8(r, end))?, self.binv), self.uk, self.ainv);
         if v >= 1 << 39 {
             return None;
         }
@@ -618,10 +632,12 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     let n_slots = ((lines_est as f64 * 1.1) as usize + (1 << EB)).next_multiple_of(1 << EB);
     let exs: Vec<u64> = rows.iter().map(|r| r.2).take(4000).collect();
     let echeck = |k: u64| exs.iter().filter(|&&x| (dec(x, k, ainv) as usize) < n_slots).count();
-    let Some((ek, ec)) = recover(&epairs, 12, ainv, &echeck) else { return false };
-    if ec * 100 < exs.len() * 99 {
-        return false;
-    }
+    // The event key is recovered while links and clicks are parsed.
+    let ek_cell: OnceLock<Option<u64>> = OnceLock::new();
+    let find_ek = || {
+        let r = recover(&epairs, 12, ainv, &echeck).filter(|&(_, c)| c * 100 >= exs.len() * 99).map(|r| r.0);
+        let _ = ek_cell.set(r);
+    };
     let p_max = rows.iter().map(|r| r.0).filter(|&p| p < 1 << 22).max().unwrap_or(0) as usize;
     let p_cap = (n_slots / 24 + 4096).max(p_max * 2).min(1 << 22);
     lap("event key");
@@ -677,8 +693,9 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     }
     let scan_only = std::env::var_os("FAST_SCANONLY").is_some();
     let tid_next = AtomicUsize::new(0);
-    let ek_ = ek;
-    let p1: Vec<P1> = pool_finish(
+    let p1: Vec<P1> = thread::scope(|scope| {
+    scope.spawn(find_ek);
+    pool_finish(
         threads,
         n_lc + n_cc + ec.len(),
         || P1 {
@@ -701,18 +718,28 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                 let (fi, a, b) = ec[t - n_lc - n_cc];
                 let mut n = 0usize;
                 populate(&event_files[fi][a..b]);
-                index::scan_indexed::<7>(&event_files[fi][a..b], &mut st.idx, |f| n += f[0].len());
+                if std::env::var("FAST_SCANONLY").as_deref() == Ok("2") {
+                    let d = &event_files[fi][a..b];
+                    let mut x = 0u64;
+                    for c in d.chunks_exact(8) {
+                        x = x.wrapping_add(u64::from_le_bytes(c.try_into().unwrap()));
+                    }
+                    n = x as usize & 1;
+                } else {
+                    scan::lines::<7>(&event_files[fi][a..b], |f| n += f[0].len());
+                }
                 st.esc_e.push(n as u32);
             } else if t < n_lc {
                 let (fi, a, b) = lc[t];
                 let slice = &link_files[fi][a..b];
+                let end = link_files[fi].as_ptr_range().end;
                 populate(slice);
                 let mut idx = std::mem::replace(&mut st.idx, index::Index::new());
-                index::scan_indexed::<2>(slice, &mut idx, |f| {
+                scan::lines::<2>(slice, |f| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
-                    match (sh.user(f[0]), sh.user(f[1])) {
+                    match (sh.user_at(f[0], end), sh.user_at(f[1], end)) {
                         (Some((pa, aa)), Some((pb, ab))) if pa == pb && aa < 16 && ab < 16 => {
                             sh.pstate[pa].fetch_or(1 << aa | 1 << ab, Relaxed);
                             if aa != ab {
@@ -736,10 +763,11 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
             } else if t < n_lc + n_cc {
                 let (fi, a, b) = cc[t - n_lc];
                 let slice = &click_files[fi][a..b];
+                let end = click_files[fi].as_ptr_range().end;
                 populate(slice);
                 let (cws, we) = (ctx.cws, ctx.we);
                 let mut idx = std::mem::replace(&mut st.idx, index::Index::new());
-                index::scan_indexed::<4>(slice, &mut idx, |f| {
+                scan::lines::<4>(slice, |f| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
@@ -749,7 +777,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     }
                     let Some(camp) = ctx.campaigns.get(f[2]) else { return };
                     let cts = (t - cws) as u32;
-                    let u = sh.user(f[1]);
+                    let u = sh.user_at(f[1], end);
                     match (u, ckey(f[0])) {
                         (Some((p, a)), Some(k)) if a < 8 => {
                             let user = (p as u64) << 3 | a as u64;
@@ -772,10 +800,15 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
             } else {
                 let (fi, a, b) = ec[t - n_lc - n_cc];
                 let slice = &event_files[fi][a..b];
+                let end = event_files[fi].as_ptr_range().end;
                 populate(slice);
                 let (ws, we) = (ctx.ws, ctx.we);
+                let Some(ek_) = *ek_cell.wait() else {
+                    sh.abort.store(true, Relaxed);
+                    return;
+                };
                 let mut idx = std::mem::replace(&mut st.idx, index::Index::new());
-                index::scan_indexed::<7>(slice, &mut idx, |f| {
+                scan::lines::<7>(slice, |f| {
                     if f[0].is_empty() {
                         return;
                     }
@@ -814,7 +847,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     let valid = (lo >> 31) & 3 != T_INVALID;
                     let mut user = 0u64;
                     if valid {
-                        match sh.user(f[1]) {
+                        match sh.user_at(f[1], end) {
                             Some((p, a)) if a < 8 => user = (p as u64) << 3 | a as u64,
                             u => {
                                 if let Some((p, _)) = u {
@@ -825,7 +858,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                         }
                     }
                     let slot = if f[0].len() > 1 && f[0][0] == b'e' {
-                        b36(&f[0][1..]).map(|o| dec(unx(o, sh.binv), ek_, sh.ainv) as usize).filter(|&v| v < sh.n_slots)
+                        scan::b36(&f[0][1..], scan::load8(&f[0][1..], end)).map(|o| dec(unx(o, sh.binv), ek_, sh.ainv) as usize).filter(|&v| v < sh.n_slots)
                     } else {
                         None
                     };
@@ -853,7 +886,9 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
             st.ev.finish();
             st.cl.finish();
         },
-    );
+    )
+    });
+    lap("parse");
     if profile {
         let c: Vec<f64> = (0..3).map(|i| p1.iter().map(|s| s.cpu[i]).sum()).collect();
         eprintln!("parse cpu: links {:.3} clicks {:.3} events {:.3}", c[0], c[1], c[2]);
@@ -866,7 +901,6 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     }
     let mut p1 = p1;
     p1.sort_by_key(|s| s.tid);
-    lap("parse");
 
     // ------------------------------------------------ pass 2: dedup, click grouping
     let dense_map = memmap2::MmapMut::map_anon(n_slots * 16).expect("dense");
@@ -1405,6 +1439,5 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     std::mem::forget(ev_region);
     std::mem::forget(cl_region);
     std::mem::forget(sh);
-    let _ = OnceLock::<()>::new();
     true
 }

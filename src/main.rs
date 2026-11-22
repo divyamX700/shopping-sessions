@@ -15,6 +15,7 @@ mod fast;
 mod index;
 mod keys;
 mod out;
+mod scan;
 mod sink;
 mod ts;
 
