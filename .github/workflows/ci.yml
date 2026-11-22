@@ -31,7 +31,7 @@ jobs:
         run: |
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
-          pip install --quiet polars
+          pip install --quiet polars pyarrow duckdb
 
       - name: Unit tests (scanner fuzz runs the AVX-512 path where the runner has it)
         run: RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release -q 2>&1 | tail -3
@@ -56,6 +56,12 @@ jobs:
             SHOP_NOFAST=1 DATA_DIR="$RUNNER_TEMP/$d" OUTPUT_DIR="$b" NCPU=$(nproc) ./target/release/shopping
             echo "$d: $(cd scripts && python3 compare.py "$a" "$b" | tail -1)"
           done
+
+      - name: Output readable by polars, pyarrow and DuckDB alike
+        run: |
+          o=$(mktemp -d)
+          DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./target/release/shopping
+          python3 scripts/readers.py "$o"
 
       - name: Official dev answer
         run: |

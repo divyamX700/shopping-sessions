@@ -303,6 +303,10 @@ pub fn write(path: &Path, schema: &[Field], cols: Vec<Col>) -> std::io::Result<(
 /// column is optional).
 pub enum DCol {
     Plain(Col),
+    /// INT32/INT64 values, DELTA_BINARY_PACKED.
+    Delta(Col),
+    /// Required strings (bytes, ends), DELTA_BYTE_ARRAY.
+    DeltaStr(Vec<u8>, Vec<u32>),
     Dict { dict: Col, idx: Vec<u32>, defs: Option<Vec<i16>> },
 }
 
@@ -411,8 +415,8 @@ pub fn write_dict(path: &Path, schema: &[Field], cols: Vec<DCol>, rows: usize) -
     let mut file = BufWriter::with_capacity(1 << 22, File::create(path)?);
     file.write_all(b"PAR1")?;
     let mut offset = 4u64;
-    // (physical type, chunk start, dictionary page?, data page offset, chunk size)
-    let mut chunks: Vec<(i32, u64, bool, u64, u64)> = Vec::with_capacity(cols.len());
+    // (physical type, chunk start, dictionary page?, data page offset, chunk size, data encoding)
+    let mut chunks: Vec<(i32, u64, bool, u64, u64, i32)> = Vec::with_capacity(cols.len());
     let ty_of = |c: &Col| match c {
         Col::Str(..) | Col::OptStr(..) => BYTE_ARRAY,
         Col::I32(_) => INT32,
@@ -430,7 +434,35 @@ pub fn write_dict(path: &Path, schema: &[Field], cols: Vec<DCol>, rows: usize) -
                     file.write_all(&h)?;
                     file.write_all(&body)?;
                     offset += (h.len() + body.len()) as u64;
-                    chunks.push((ty, start, false, start, offset - start));
+                    chunks.push((ty, start, false, start, offset - start, ENC_PLAIN));
+                }
+            }
+            DCol::Delta(_) | DCol::DeltaStr(..) => {
+                let (body, ty, enc) = match col {
+                    DCol::Delta(c) => {
+                        let v: Vec<i64> = match c {
+                            Col::I32(v) => v.iter().map(|&x| x as i64).collect(),
+                            Col::I64(v) => v.clone(),
+                            _ => panic!("delta needs integers"),
+                        };
+                        let mut b = Vec::new();
+                        delta_binary_packed(&v, &mut b);
+                        (b, ty_of(c), ENC_DELTA_BINARY_PACKED)
+                    }
+                    DCol::DeltaStr(buf, ends) => {
+                        let mut b = Vec::new();
+                        delta_byte_array(buf, ends, &mut b);
+                        (b, BYTE_ARRAY, ENC_DELTA_BYTE_ARRAY)
+                    }
+                    _ => unreachable!(),
+                };
+                types.push(ty);
+                if rows > 0 {
+                    let h = page_header(PAGE_DATA, body.len(), rows, enc, None);
+                    file.write_all(&h)?;
+                    file.write_all(&body)?;
+                    offset += (h.len() + body.len()) as u64;
+                    chunks.push((ty, start, false, start, offset - start, enc));
                 }
             }
             DCol::Dict { dict, idx, defs } => {
@@ -454,7 +486,7 @@ pub fn write_dict(path: &Path, schema: &[Field], cols: Vec<DCol>, rows: usize) -
                     file.write_all(&h)?;
                     file.write_all(&body)?;
                     offset += (h.len() + body.len()) as u64;
-                    chunks.push((ty, start, true, data_at, offset - start));
+                    chunks.push((ty, start, true, data_at, offset - start, ENC_RLE_DICTIONARY));
                 }
             }
         }
@@ -484,7 +516,7 @@ pub fn write_dict(path: &Path, schema: &[Field], cols: Vec<DCol>, rows: usize) -
         t.list(4, T_STRUCT, 1);
         t.begin();
         t.list(1, T_STRUCT, chunks.len());
-        for (field, &(ty, start, dict, data_at, size)) in schema.iter().zip(&chunks) {
+        for (field, &(ty, start, dict, data_at, size, enc)) in schema.iter().zip(&chunks) {
             t.begin();
             t.i64(2, start as i64);
             t.struct_field(3);
@@ -496,7 +528,7 @@ pub fn write_dict(path: &Path, schema: &[Field], cols: Vec<DCol>, rows: usize) -
                 t.zigzag(ENC_RLE_DICTIONARY as i64);
             } else {
                 t.list(2, T_I32, 2);
-                t.zigzag(ENC_PLAIN as i64);
+                t.zigzag(enc as i64);
                 t.zigzag(ENC_RLE as i64);
             }
             t.list(3, T_BINARY, 1);
@@ -525,4 +557,81 @@ pub fn write_dict(path: &Path, schema: &[Field], cols: Vec<DCol>, rows: usize) -
     file.write_all(&(t.buf.len() as u32).to_le_bytes())?;
     file.write_all(b"PAR1")?;
     file.flush()
+}
+
+// ---------------------------------------------------------------- delta encodings
+
+const ENC_DELTA_BINARY_PACKED: i32 = 5;
+const ENC_DELTA_BYTE_ARRAY: i32 = 7;
+
+/// DELTA_BINARY_PACKED: blocks of 128 values in 4 miniblocks of 32.
+pub(crate) fn delta_binary_packed(vals: &[i64], out: &mut Vec<u8>) {
+    let mut t = Thrift::new();
+    t.varint(128);
+    t.varint(4);
+    t.varint(vals.len() as u64);
+    t.zigzag(vals.first().copied().unwrap_or(0));
+    let mut i = 1;
+    let mut deltas = [0u64; 128];
+    while i < vals.len() {
+        let n = (vals.len() - i).min(128);
+        let mut min = i64::MAX;
+        let mut raw = [0i64; 128];
+        for k in 0..n {
+            raw[k] = vals[i + k].wrapping_sub(vals[i + k - 1]);
+            min = min.min(raw[k]);
+        }
+        t.zigzag(min);
+        let mut widths = [0u8; 4];
+        for k in 0..128 {
+            deltas[k] = if k < n { raw[k].wrapping_sub(min) as u64 } else { 0 };
+        }
+        for m in 0..4 {
+            let mx = deltas[m * 32..m * 32 + 32].iter().copied().max().unwrap_or(0);
+            widths[m] = (64 - mx.leading_zeros()) as u8;
+        }
+        t.buf.extend_from_slice(&widths);
+        let used = n.div_ceil(32);
+        for m in 0..used {
+            let w = widths[m] as u32;
+            if w == 0 {
+                continue;
+            }
+            let mut acc: u128 = 0;
+            let mut nb = 0u32;
+            for k in 0..32 {
+                acc |= (deltas[m * 32 + k] as u128) << nb;
+                nb += w;
+                while nb >= 8 {
+                    t.buf.push(acc as u8);
+                    acc >>= 8;
+                    nb -= 8;
+                }
+            }
+        }
+        i += n;
+    }
+    out.extend_from_slice(&t.buf);
+}
+
+/// DELTA_BYTE_ARRAY: shared-prefix lengths, then the suffixes as
+/// DELTA_LENGTH_BYTE_ARRAY (lengths, then the bytes).
+pub(crate) fn delta_byte_array(buf: &[u8], ends: &[u32], out: &mut Vec<u8>) {
+    let mut pre = Vec::with_capacity(ends.len());
+    let mut suf = Vec::with_capacity(ends.len());
+    let mut bytes = Vec::new();
+    let mut prev: &[u8] = &[];
+    let mut st = 0usize;
+    for &e in ends {
+        let s = &buf[st..e as usize];
+        let p = s.iter().zip(prev).take_while(|(a, b)| a == b).count();
+        pre.push(p as i64);
+        suf.push((s.len() - p) as i64);
+        bytes.extend_from_slice(&s[p..]);
+        prev = s;
+        st = e as usize;
+    }
+    delta_binary_packed(&pre, out);
+    delta_binary_packed(&suf, out);
+    out.extend_from_slice(&bytes);
 }

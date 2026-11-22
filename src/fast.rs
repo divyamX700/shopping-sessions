@@ -1620,6 +1620,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     return;
                 }
                 let rows = a.days.len();
+                let delta_names = std::env::var_os("FAST_DICTNAMES").is_none();
                 // Names: a person's rows are consecutive, so the dictionary is
                 // the sequence of distinct consecutive names.
                 let (mut nb, mut ne, mut ni) = (Vec::new(), Vec::new(), Vec::with_capacity(rows));
@@ -1635,6 +1636,11 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     prev = nm;
                     st = e as usize;
                 }
+                let names_col = if delta_names {
+                    out::DCol::DeltaStr(a.names, a.name_ends)
+                } else {
+                    out::DCol::Dict { dict: out::Col::Str(nb, ne), idx: ni, defs: None }
+                };
                 let small = |v: Vec<i32>| -> out::DCol {
                     let (lo, hi) = (v.iter().copied().min().unwrap_or(0), v.iter().copied().max().unwrap_or(0));
                     if (hi as i64 - lo as i64) >= 1 << 20 {
@@ -1666,11 +1672,11 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     &user_dir.join(format!("part-{i:03}.parquet")),
                     out::USER_SCHEMA,
                     vec![
-                        out::DCol::Dict { dict: out::Col::Str(nb, ne), idx: ni, defs: None },
+                        names_col,
                         small(a.days),
                         small(a.sessions),
                         small(a.events),
-                        out::DCol::Plain(rev),
+                        out::DCol::Delta(rev),
                         out::DCol::Dict { dict: out::Col::Str(cb, ce), idx: a.top.iter().map(|&c| c as u32).collect(), defs: Some(a.top_defs) },
                     ],
                     rows,
