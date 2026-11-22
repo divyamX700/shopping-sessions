@@ -1207,7 +1207,8 @@ fn main() {
         bench_parse(&ctx, &path);
         return;
     }
-    let release_input = std::env::var_os("SHOP_KEEPMAP").is_none();
+    // Releasing parsed input pages measured slower on 4 cores (kernel time).
+    let release_input = std::env::var_os("SHOP_RELEASE").is_some();
     if let Some(v) = std::env::var("SHOP_RA").ok().and_then(|v| v.parse().ok()) {
         scan::READ_AHEAD.store(v, std::sync::atomic::Ordering::Relaxed);
     }
