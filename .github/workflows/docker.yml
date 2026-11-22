@@ -1,0 +1,70 @@
+name: docker
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Data on tmpfs
+        run: |
+          nproc; lscpu | grep "Model name"; free -g | head -2
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          sudo mkdir -p /mnt/data && sudo mount -t tmpfs -o size=6g tmpfs /mnt/data && sudo chmod 777 /mnt/data
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output /mnt/data/p20 | tail -1
+          sudo chmod -R a+rX /mnt/data
+      - name: Build images
+        run: |
+          docker build -q -t ours . > /dev/null && echo "ours built"
+          git clone -q https://github.com/loveconnor/larp-shopping-sessions-v5 /tmp/larp
+          docker build -q -t larp /tmp/larp > /dev/null && echo "larp built"
+          docker images | head -5
+      - name: Time containers
+        env:
+          RUNS: ${{ inputs.runs }}
+        run: |
+          N=$(nproc)
+          : > /tmp/t.txt
+          for r in $(seq 1 $RUNS); do
+            for img in larp ours; do
+              out=$(mktemp -d); chmod 777 $out
+              s=$(date +%s.%N)
+              docker run --rm --network none --read-only --tmpfs /tmp:size=64m --user 1000:1000 --cpus=$N \
+                -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=8 \
+                -v /mnt/data/p20:/data:ro -v $out:/output $img > /dev/null 2>/tmp/err_$img.txt
+              code=$?
+              e=$(date +%s.%N)
+              echo "$img $(python3 -c "print(round($e-$s,4))") exit=$code" | tee -a /tmp/t.txt
+              sudo rm -rf $out
+            done
+          done
+          tail -3 /tmp/err_ours.txt /tmp/err_larp.txt
+          python3 - <<'EOF'
+          import collections, statistics
+          d = collections.defaultdict(list)
+          for line in open("/tmp/t.txt"):
+              k, v, _ = line.split()
+              d[k].append(float(v))
+          for k, v in d.items():
+              print(f"{k:10s} median {statistics.median(v):.3f}  min {min(v):.3f}  n {len(v)}")
+          EOF
+      - name: Direct binary inside image vs host build
+        run: |
+          id=$(docker create ours); docker cp $id:/shopping /tmp/ours-img; docker rm $id >/dev/null
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
+          for r in 1 2 3; do
+            for b in /tmp/ours-img ./target/release/shopping; do
+              out=$(mktemp -d); s=$(date +%s.%N)
+              env DATA_DIR=/mnt/data/p20 OUTPUT_DIR=$out NCPU=8 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_POPULATE=1 $b >/dev/null 2>&1
+              e=$(date +%s.%N); echo "$b $(python3 -c "print(round($e-$s,4))")"; rm -rf $out
+            done
+          done
