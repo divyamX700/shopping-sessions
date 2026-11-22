@@ -23,8 +23,7 @@ jobs:
         run: |
           for i in 1 2; do SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast|cpu|general"; done
           for m in 2 1; do echo "scanonly $m"; FAST_SCANONLY=$m SHOP_PROFILE=1 SHOP_NOFAST=0 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 30 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done
-          for r in 1 2; do for v in X FAST_PDEP; do for k in 8 7; do echo "$v FAST_K=$k 1 thread"; env $v=1 FAST_K=$k SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=1 timeout 40 ./target/release/shopping 2>&1 | grep -E "parse cpu: links" | head -1; done; done; done
-          for r in 1 2; do for v in X FAST_PDEP; do echo "$v full threads=$(nproc)"; env $v=1 SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast: parse|fast done" | head -2; done; done
+          for r in 1 2; do SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "fast:|cpu"; done
       - name: Perf
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null

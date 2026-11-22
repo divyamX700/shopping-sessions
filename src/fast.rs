@@ -1278,12 +1278,14 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         xev: Vec<XEv>,
         edges: Vec<Edge>,
         local: Vec<ERec>,
+        cpu: [f64; 3],
     }
     let mut p3: Vec<P3> = pool_finish(
         threads,
         n_eb,
-        || P3 { agg: Agg::new(ctx), xev: Vec::new(), edges: Vec::new(), local: vec![ERec::default(); 1 << EB] },
+        || P3 { agg: Agg::new(ctx), xev: Vec::new(), edges: Vec::new(), local: vec![ERec::default(); 1 << EB], cpu: [0.0; 3] },
         |st, b| {
+            let t0 = Instant::now();
             let mut local = std::mem::take(&mut st.local);
             local.fill(ERec::default());
             for s in &p1 {
@@ -1296,6 +1298,8 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                     }
                 }
             }
+            let t1 = Instant::now();
+            st.cpu[0] += (t1 - t0).as_secs_f64();
             let mut cur = NONE;
             let mut head: Option<Run> = None;
             let mut buf: Vec<Ev> = Vec::new();
@@ -1333,9 +1337,16 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                 }
             }
             st.local = local;
+            st.cpu[1] += t1.elapsed().as_secs_f64();
         },
         |_, _| {},
     );
+    if profile {
+        let d: f64 = p3.iter().map(|s| s.cpu[0]).sum();
+        let w: f64 = p3.iter().map(|s| s.cpu[1]).sum();
+        eprintln!("persons cpu: dedup {d:.3} walk {w:.3}");
+    }
+    lap("ranges");
     // Stitch the runs that cross range boundaries.
     let mut edges: Vec<Edge> = p3.iter_mut().flat_map(|s| s.edges.drain(..)).collect();
     edges.sort_unstable_by_key(|e| e.b);
@@ -1369,7 +1380,7 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
     let p3b: Vec<P3> = pool_finish(
         threads,
         done.len(),
-        || P3 { agg: Agg::new(ctx), xev: Vec::new(), edges: Vec::new(), local: Vec::new() },
+        || P3 { agg: Agg::new(ctx), xev: Vec::new(), edges: Vec::new(), local: Vec::new(), cpu: [0.0; 3] },
         |st, k| {
             let mut r = done[k].lock().unwrap();
             let p = r.p as usize;
