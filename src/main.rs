@@ -1374,6 +1374,7 @@ fn main() {
         keys::EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
+    sink::NO_NT.store(std::env::var_os("SHOP_NONT").is_some(), AtomicOrdering::Relaxed);
     let diag2_on = std::env::var_os("SHOP_DIAG2").is_some();
     #[cfg(target_os = "linux")]
     if diag2_on {

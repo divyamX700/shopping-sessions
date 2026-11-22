@@ -10,6 +10,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const BLOCK: usize = 16 << 10;
+/// Normal stores instead of non-temporal ones for staged records (SHOP_NONT).
+pub static NO_NT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const STAGE_BYTES: usize = 128;
 
 /// A region handed out in BLOCK-sized pieces by an atomic bump pointer.
@@ -171,7 +173,7 @@ impl<'r, T: Copy + Default> Sink<'r, T> {
             let src = self.stage.as_ptr().add(p * k) as *const u8;
             let dst = self.cur[p] as *mut u8;
             let bytes = k * std::mem::size_of::<T>();
-            if bytes == STAGE_BYTES {
+            if bytes == STAGE_BYTES && !NO_NT.load(Ordering::Relaxed) {
                 stream128(dst, src);
             } else {
                 std::ptr::copy_nonoverlapping(src, dst, bytes);
