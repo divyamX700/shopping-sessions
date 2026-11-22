@@ -97,7 +97,7 @@ jobs:
       - name: Where container time goes
         run: |
           N=$(nproc)
-          for flags in "--cpus $N" "--cpus $N -e FAST_K=8" "--cpus $N --tmpfs /output:rw,size=2g,mode=1777" "--cpus $N -e FAST_SCANONLY=2"; do
+          for flags in "--cpus $N --memory 14g --memory-swap 14g"; do
           for k in 1 2; do
           out=$(mktemp -d); chmod 777 "$out"
           s=$(date +%s.%N)

@@ -295,3 +295,234 @@ pub fn write(path: &Path, schema: &[Field], cols: Vec<Col>) -> std::io::Result<(
     file.write_all(b"PAR1")?;
     file.flush()
 }
+
+// ---------------------------------------------------------------- dictionary pages
+
+/// A column for `write_dict`: plain, or dictionary encoded (dictionary values
+/// as a plain column, one index per present row, definition levels when the
+/// column is optional).
+pub enum DCol {
+    Plain(Col),
+    Dict { dict: Col, idx: Vec<u32>, defs: Option<Vec<i16>> },
+}
+
+const ENC_RLE_DICTIONARY: i32 = 8;
+const PAGE_DICTIONARY: i32 = 2;
+
+/// RLE / bit-packing hybrid of `vals` at bit width `w`.
+pub(crate) fn rle_hybrid(vals: &[u32], w: u32, out: &mut Vec<u8>) {
+    let mut t = Thrift::new();
+    let bytes = w.div_ceil(8) as usize;
+    let packed = |t: &mut Thrift, a: usize, z: usize| {
+        let groups = (z - a).div_ceil(8);
+        t.varint(((groups as u64) << 1) | 1);
+        let mut acc = 0u64;
+        let mut nb = 0u32;
+        for k in 0..groups * 8 {
+            let v = if a + k < z { vals[a + k] as u64 } else { 0 };
+            acc |= v << nb;
+            nb += w;
+            while nb >= 8 {
+                t.buf.push(acc as u8);
+                acc >>= 8;
+                nb -= 8;
+            }
+        }
+        if nb > 0 {
+            t.buf.push(acc as u8);
+        }
+    };
+    let n = vals.len();
+    let mut i = 0;
+    let mut pending: Option<usize> = None;
+    while i < n {
+        let mut r = 1;
+        while i + r < n && vals[i + r] == vals[i] {
+            r += 1;
+        }
+        if r >= 8 {
+            if let Some(ps) = pending.take() {
+                let pad = (8 - (i - ps) % 8) % 8;
+                packed(&mut t, ps, i + pad);
+                i += pad;
+                r -= pad;
+            }
+            if r > 0 {
+                t.varint((r as u64) << 1);
+                t.buf.extend_from_slice(&vals[i].to_le_bytes()[..bytes]);
+                i += r;
+            }
+        } else {
+            if pending.is_none() {
+                pending = Some(i);
+            }
+            i += r;
+        }
+    }
+    if let Some(ps) = pending {
+        packed(&mut t, ps, n);
+    }
+    out.extend_from_slice(&t.buf);
+}
+
+fn page_header(kind: i32, body_len: usize, rows: usize, enc: i32, dict_values: Option<usize>) -> Vec<u8> {
+    let mut h = Thrift::new();
+    h.begin();
+    h.i32(1, kind);
+    h.i32(2, body_len as i32);
+    h.i32(3, body_len as i32);
+    if let Some(nv) = dict_values {
+        h.struct_field(7);
+        h.i32(1, nv as i32);
+        h.i32(2, ENC_PLAIN);
+        h.end();
+    } else {
+        h.struct_field(5);
+        h.i32(1, rows as i32);
+        h.i32(2, enc);
+        h.i32(3, ENC_RLE);
+        h.i32(4, ENC_RLE);
+        h.end();
+    }
+    h.end();
+    h.buf
+}
+
+fn def_levels(defs: &[i16], out: &mut Vec<u8>) {
+    let rows = defs.len();
+    let groups = rows.div_ceil(8);
+    let mut rle = Thrift::new();
+    rle.varint(((groups as u64) << 1) | 1);
+    let mut levels = rle.buf;
+    let base = levels.len();
+    levels.resize(base + groups, 0);
+    for (i, &d) in defs.iter().enumerate() {
+        if d != 0 {
+            levels[base + i / 8] |= 1 << (i % 8);
+        }
+    }
+    out.extend_from_slice(&(levels.len() as u32).to_le_bytes());
+    out.extend_from_slice(&levels);
+}
+
+/// Like `write`, with dictionary-encoded columns where given.
+pub fn write_dict(path: &Path, schema: &[Field], cols: Vec<DCol>, rows: usize) -> std::io::Result<()> {
+    assert_eq!(schema.len(), cols.len(), "column count");
+    let mut file = BufWriter::with_capacity(1 << 22, File::create(path)?);
+    file.write_all(b"PAR1")?;
+    let mut offset = 4u64;
+    // (physical type, chunk start, dictionary page?, data page offset, chunk size)
+    let mut chunks: Vec<(i32, u64, bool, u64, u64)> = Vec::with_capacity(cols.len());
+    let ty_of = |c: &Col| match c {
+        Col::Str(..) | Col::OptStr(..) => BYTE_ARRAY,
+        Col::I32(_) => INT32,
+        Col::I64(_) => INT64,
+    };
+    let mut types = Vec::new();
+    for col in &cols {
+        let start = offset;
+        match col {
+            DCol::Plain(c) => {
+                types.push(ty_of(c));
+                if rows > 0 {
+                    let (body, ty) = page_body(c, rows);
+                    let h = page_header(PAGE_DATA, body.len(), rows, ENC_PLAIN, None);
+                    file.write_all(&h)?;
+                    file.write_all(&body)?;
+                    offset += (h.len() + body.len()) as u64;
+                    chunks.push((ty, start, false, start, offset - start));
+                }
+            }
+            DCol::Dict { dict, idx, defs } => {
+                types.push(ty_of(dict));
+                if rows > 0 {
+                    let nd = col_rows(dict);
+                    let (dbody, ty) = page_body(dict, nd);
+                    let h = page_header(PAGE_DICTIONARY, dbody.len(), nd, ENC_PLAIN, Some(nd));
+                    file.write_all(&h)?;
+                    file.write_all(&dbody)?;
+                    offset += (h.len() + dbody.len()) as u64;
+                    let data_at = offset;
+                    let mut body = Vec::with_capacity(idx.len() * 2 + 64);
+                    if let Some(d) = defs {
+                        def_levels(d, &mut body);
+                    }
+                    let w = (32 - (nd.max(2) as u32 - 1).leading_zeros()).max(1);
+                    body.push(w as u8);
+                    rle_hybrid(idx, w, &mut body);
+                    let h = page_header(PAGE_DATA, body.len(), rows, ENC_RLE_DICTIONARY, None);
+                    file.write_all(&h)?;
+                    file.write_all(&body)?;
+                    offset += (h.len() + body.len()) as u64;
+                    chunks.push((ty, start, true, data_at, offset - start));
+                }
+            }
+        }
+    }
+    let mut t = Thrift::new();
+    t.begin();
+    t.i32(1, 1);
+    t.list(2, T_STRUCT, schema.len() + 1);
+    t.begin();
+    t.binary(4, b"schema");
+    t.i32(5, schema.len() as i32);
+    t.end();
+    for (field, &ty) in schema.iter().zip(&types) {
+        t.begin();
+        t.i32(1, ty);
+        t.i32(3, if field.optional { OPTIONAL } else { REQUIRED });
+        t.binary(4, field.name.as_bytes());
+        match field.logical {
+            Logical::String => t.i32(6, CONVERTED_UTF8),
+            Logical::Date => t.i32(6, CONVERTED_DATE),
+            Logical::None => {}
+        }
+        t.end();
+    }
+    t.i64(3, rows as i64);
+    if rows > 0 {
+        t.list(4, T_STRUCT, 1);
+        t.begin();
+        t.list(1, T_STRUCT, chunks.len());
+        for (field, &(ty, start, dict, data_at, size)) in schema.iter().zip(&chunks) {
+            t.begin();
+            t.i64(2, start as i64);
+            t.struct_field(3);
+            t.i32(1, ty);
+            if dict {
+                t.list(2, T_I32, 3);
+                t.zigzag(ENC_PLAIN as i64);
+                t.zigzag(ENC_RLE as i64);
+                t.zigzag(ENC_RLE_DICTIONARY as i64);
+            } else {
+                t.list(2, T_I32, 2);
+                t.zigzag(ENC_PLAIN as i64);
+                t.zigzag(ENC_RLE as i64);
+            }
+            t.list(3, T_BINARY, 1);
+            t.varint(field.name.len() as u64);
+            t.buf.extend_from_slice(field.name.as_bytes());
+            t.i32(4, CODEC_NONE);
+            t.i64(5, rows as i64);
+            t.i64(6, size as i64);
+            t.i64(7, size as i64);
+            t.i64(9, data_at as i64);
+            if dict {
+                t.i64(11, start as i64);
+            }
+            t.end();
+            t.end();
+        }
+        t.i64(2, chunks.iter().map(|c| c.4 as i64).sum());
+        t.i64(3, rows as i64);
+        t.end();
+    } else {
+        t.list(4, T_STRUCT, 0);
+    }
+    t.binary(6, b"shopping-sessions");
+    t.end();
+    file.write_all(&t.buf)?;
+    file.write_all(&(t.buf.len() as u32).to_le_bytes())?;
+    file.write_all(b"PAR1")?;
+    file.flush()
+}

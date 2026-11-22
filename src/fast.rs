@@ -538,8 +538,7 @@ impl Agg {
                 self.catsum[c as usize] = 0;
             }
             self.touched.clear();
-            self.top.extend_from_slice(&ctx.cat_names[best as usize]);
-            self.top_ends.push(self.top.len() as u32);
+            self.top.push(best);
             self.top_defs.push(1);
         }
     }
@@ -1620,17 +1619,61 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
                 if a.days.is_empty() {
                     return;
                 }
-                out::write(
+                let rows = a.days.len();
+                // Names: a person's rows are consecutive, so the dictionary is
+                // the sequence of distinct consecutive names.
+                let (mut nb, mut ne, mut ni) = (Vec::new(), Vec::new(), Vec::with_capacity(rows));
+                let mut prev: &[u8] = &[];
+                let mut st = 0usize;
+                for (r, &e) in a.name_ends.iter().enumerate() {
+                    let nm = &a.names[st..e as usize];
+                    if r == 0 || nm != prev {
+                        nb.extend_from_slice(nm);
+                        ne.push(nb.len() as u32);
+                    }
+                    ni.push(ne.len() as u32 - 1);
+                    prev = nm;
+                    st = e as usize;
+                }
+                let small = |v: Vec<i32>| -> out::DCol {
+                    let (lo, hi) = (v.iter().copied().min().unwrap_or(0), v.iter().copied().max().unwrap_or(0));
+                    if (hi as i64 - lo as i64) >= 1 << 20 {
+                        return out::DCol::Plain(out::Col::I32(v));
+                    }
+                    let mut map = vec![u32::MAX; (hi - lo + 1) as usize];
+                    let (mut dict, mut idx) = (Vec::new(), Vec::with_capacity(v.len()));
+                    for &x in &v {
+                        let m = &mut map[(x - lo) as usize];
+                        if *m == u32::MAX {
+                            *m = dict.len() as u32;
+                            dict.push(x);
+                        }
+                        idx.push(*m);
+                    }
+                    out::DCol::Dict { dict: out::Col::I32(dict), idx, defs: None }
+                };
+                let rev = if a.revenue.iter().all(|&x| x <= i32::MAX as i64) {
+                    out::Col::I32(a.revenue.iter().map(|&x| x as i32).collect())
+                } else {
+                    out::Col::I64(a.revenue)
+                };
+                let (mut cb, mut ce) = (Vec::new(), Vec::new());
+                for c in &ctx.cat_names {
+                    cb.extend_from_slice(c);
+                    ce.push(cb.len() as u32);
+                }
+                out::write_dict(
                     &user_dir.join(format!("part-{i:03}.parquet")),
                     out::USER_SCHEMA,
                     vec![
-                        out::Col::Str(a.names, a.name_ends),
-                        out::Col::I32(a.days),
-                        out::Col::I32(a.sessions),
-                        out::Col::I32(a.events),
-                        out::Col::I64(a.revenue),
-                        out::Col::OptStr(a.top, a.top_ends, a.top_defs),
+                        out::DCol::Dict { dict: out::Col::Str(nb, ne), idx: ni, defs: None },
+                        small(a.days),
+                        small(a.sessions),
+                        small(a.events),
+                        out::DCol::Plain(rev),
+                        out::DCol::Dict { dict: out::Col::Str(cb, ce), idx: a.top.iter().map(|&c| c as u32).collect(), defs: Some(a.top_defs) },
                     ],
+                    rows,
                 )
                 .expect("write user_daily");
             });
