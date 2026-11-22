@@ -6,9 +6,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tools/generator ./tools/generator
-# Scorers are Intel Xeon, Cascade Lake or newer: build for Cascade Lake (AVX-512).
-# Measured 23-28% faster than x86-64-v3 on CI, identical output.
-ENV BASE_FLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static"
+# AVX2 (x86-64-v3), no 512-bit instructions: on Cascade Lake, heavy AVX-512
+# use lowers the core clock for everything else.
+ENV BASE_FLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
 ENV T=x86_64-unknown-linux-gnu
 # Profile-guided build (measured 2.5-2.8% faster, identical output): train on
 # small datasets from the official generator (seeds unrelated to any scoring
@@ -31,6 +31,6 @@ RUN set -e; \
 
 FROM scratch
 COPY --from=build /shopping /shopping
-ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8 MIMALLOC_ALLOW_LARGE_OS_PAGES=1
+ENV DATA_DIR=/data OUTPUT_DIR=/output NCPU=8 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 FAST_NO512=1
 USER 1000:1000
 CMD ["/shopping"]
