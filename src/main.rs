@@ -246,21 +246,32 @@ fn pool_finish<S: Send>(
 /// read with one pread (plus a little past b for the last line).
 fn read_chunk<'b>(f: &std::fs::File, a: usize, b: usize, len: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
     use std::os::unix::fs::FileExt;
-    let lo = a.max(1) - 1;
+    // Read from a page-aligned file offset into a page-aligned spot of the
+    // buffer: the kernel's copy (rep movsb) is several times slower on Intel
+    // when source and destination are misaligned relative to each other
+    // (starting at a - 1 made every read 1 byte off).
+    let lo = if pread_aligned() { (a.max(1) - 1) & !4095 } else { a.max(1) - 1 };
     let mut over = 4 << 10;
     loop {
         let hi = (b + over).min(len);
         let n = hi - lo;
-        if buf.len() < n + 64 {
-            buf.resize(n + 64, 0);
+        if buf.len() < n + 4096 + 64 {
+            buf.resize(n + 4096 + 64, 0);
         }
-        f.read_exact_at(&mut buf[..n], lo as u64).expect("read input");
-        buf[n..n + 64].fill(0);
-        if let Some((s, e)) = line_span(&buf[..n], lo, a, b, len) {
-            return &buf[s..e];
+        let d = if pread_aligned() { buf.as_ptr().align_offset(4096) } else { 0 };
+        f.read_exact_at(&mut buf[d..d + n], lo as u64).expect("read input");
+        buf[d + n..d + n + 64].fill(0);
+        if let Some((s, e)) = line_span(&buf[d..d + n], lo, a, b, len) {
+            return &buf[d + s..d + e];
         }
         over *= 4;
     }
+}
+
+#[inline]
+fn pread_aligned() -> bool {
+    static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *A.get_or_init(|| std::env::var_os("SHOP_PREAD_UNALIGNED").is_none())
 }
 
 /// The lines of raw range [a, b) of a mapped file.
