@@ -914,7 +914,6 @@ pub fn run(ctx: &Ctx, data: &Path, outdir: &Path, threads: usize, profile: bool)
         }
     }
     let scan_only = std::env::var_os("FAST_SCANONLY").is_some();
-    scan::PDEP.store(std::env::var_os("FAST_PDEP").is_some(), Relaxed);
     let km: u32 = std::env::var("FAST_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let tp = Tsp::new(ctx.ws, ctx.we);
     let tid_next = AtomicUsize::new(0);
