@@ -64,6 +64,7 @@ jobs:
         run: |
           docker build -q -t cur . >/dev/null
           BASE="${{ github.event.inputs.base }}"
+          BASE=${BASE:-https://github.com/deltaparticle/Databricks-Buildathon@d3fb904bfe86c9958120418578f67d98ea958f12}
           if [ -n "$BASE" ]; then
             git clone -q "${BASE%@*}" /tmp/base && (cd /tmp/base && git checkout -q "${BASE##*@}")
             docker build -q -t base /tmp/base >/dev/null

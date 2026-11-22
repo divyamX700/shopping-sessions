@@ -62,11 +62,13 @@ pub fn lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N
             let cm = view(c0, c1, c2, o as u32) & keep;
             let qm = view(q0, q1, q2, o as u32) & keep;
             if l > 0 && cm.count_ones() as usize == N - 1 {
-                let line = &data[start..start + l];
                 let mut out: [&'a [u8]; N] = [&[]; N];
                 let mut s = 0usize;
                 let mut m = cm;
                 let mut wrapped = 0u32;
+                // SAFETY: every index read is in [start, start + l], and
+                // data[start + l] is the line's newline.
+                let p = unsafe { data.as_ptr().add(start) };
                 for (k, slot) in out.iter_mut().enumerate() {
                     let e = if k + 1 < N {
                         let t = m.trailing_zeros() as usize;
@@ -75,9 +77,10 @@ pub fn lines<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N
                     } else {
                         l
                     };
-                    let w = (e >= s + 2 && line[s] == b'"' && line[e - 1] == b'"') as usize;
+                    let (c0, c1) = unsafe { (*p.add(s), *p.add(e.max(s + 1) - 1)) };
+                    let w = ((e >= s + 2) as usize) & ((c0 == b'"') as usize) & ((c1 == b'"') as usize);
                     wrapped += w as u32;
-                    *slot = &line[s + w..e - w];
+                    *slot = unsafe { std::slice::from_raw_parts(p.add(s + w), e - s - 2 * w) };
                     s = e + 1;
                 }
                 if qm.count_ones() == 2 * wrapped {

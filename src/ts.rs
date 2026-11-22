@@ -43,7 +43,7 @@ static MONTH_START: [i32; TABLE_YEARS * 12] = {
 };
 
 #[inline(always)]
-fn days_in_month(year: i64, month: i64) -> i64 {
+pub(crate) fn days_in_month(year: i64, month: i64) -> i64 {
     match month {
         2 => {
             if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
