@@ -1235,7 +1235,16 @@ fn main() {
             };
             let mut dup_refs: Vec<(u32, u32)> = Vec::new();
             for (wi, w) in p1.iter().enumerate() {
-                for (j, e) in w.ev.slices(t).flatten().enumerate() {
+                let mut j = 0usize;
+                for sl in w.ev.slices(t) {
+                for (k, e) in sl.iter().enumerate() {
+                    // Person lookups miss cache: start the one 12 records ahead.
+                    if let Some(a) = sl.get(k + 12) {
+                        aliases.prefetch(mix(a.ukey));
+                    }
+                    let j0 = j;
+                    j += 1;
+                    let j = j0;
                     let f = mix(e.ekey) & fmask;
                     if st.coll[(f >> 6) as usize] & (1u64 << (f & 63)) == 0 {
                         emit(&mut st.pe, e);
@@ -1250,6 +1259,7 @@ fn main() {
                             }
                         }
                     }
+                }
                 }
             }
             for &(wi, j) in &dup_refs {

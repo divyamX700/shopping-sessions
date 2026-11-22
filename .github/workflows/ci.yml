@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Machine
         run: nproc; lscpu | grep "Model name"; free -g; grep -o -m1 avx512bw /proc/cpuinfo || echo "no avx512"
@@ -70,13 +72,10 @@ jobs:
           docker build -q -t cur . >/dev/null
           BASE="${{ github.event.inputs.base }}"
           BASE=${BASE:-https://github.com/deltaparticle/Databricks-Buildathon@3380710f536d6c0e02f9d064c214f2a8843e6da5}
-          if [ -n "$BASE" ]; then
-            git clone -q "${BASE%@*}" /tmp/base && (cd /tmp/base && git checkout -q "${BASE##*@}")
-            docker build -q -t base /tmp/base >/dev/null
-            IMGS="cur base"
-          else
-            IMGS="cur"
-          fi
+          git clone -q "${BASE%@*}" /tmp/base && (cd /tmp/base && git checkout -q "${BASE##*@}")
+          docker build -q -t base /tmp/base >/dev/null
+          git worktree add -q /tmp/prev HEAD~1 && docker build -q -t prev /tmp/prev >/dev/null
+          IMGS="cur prev base"
           run() {
             out=$(mktemp -d); chmod 777 "$out"
             s=$(date +%s.%N)
@@ -91,7 +90,7 @@ jobs:
           python3 - <<'PY'
           import statistics as st
           rows = [l.split() for l in open("ab.txt")]
-          for img in ("cur", "base"):
+          for img in ("cur", "prev", "base"):
               w = [float(r[2][5:]) for r in rows if r[0] == img and r[1] == "exit=0"]
               if w: print(f"{img}: median wall {st.median(w):.3f}s min {min(w):.3f}s n={len(w)}")
           PY
