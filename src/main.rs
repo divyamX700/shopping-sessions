@@ -14,6 +14,7 @@ mod csv;
 mod index;
 mod keys;
 mod out;
+mod scan;
 mod sink;
 mod ts;
 
@@ -529,7 +530,7 @@ fn build_aliases(paths: &[PathBuf]) -> Aliases {
     let bytes: usize = maps.iter().map(|m| m.len()).sum();
     let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(bytes / 18 + 16);
     for m in &maps {
-        csv::scan::<2>(body(m), |f| {
+        scan::lines::<2>(body(m), |f| {
             if !f[0].is_empty() && !f[1].is_empty() {
                 pairs.push((keys::key(f[0], b'u'), keys::key(f[1], b'u')));
             }
@@ -1137,13 +1138,13 @@ fn main() {
                     let (fi, a, b) = event_chunks[t];
                     let slice = &event_files[fi][a..b];
                     let (idx, ev, tsc) = (&mut st.idx, &mut st.ev, &mut st.tsc);
-                    index::scan_indexed::<7>(slice, idx, |f| parse_event(f, &ctx, ev, tsc));
+                    if std::env::var_os("SHOP_OLDSCAN").is_some() { index::scan_indexed::<7>(slice, idx, |f| parse_event(f, &ctx, ev, tsc)); } else { scan::lines::<7>(slice, |f| parse_event(f, &ctx, ev, tsc)); }
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
                     let slice = &click_files[fi][a..b];
                     let aliases = aliases_cell.wait();
                     let (idx, pc, tsc) = (&mut st.idx, &mut st.pc, &mut st.tsc);
-                    index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc));
+                    if std::env::var_os("SHOP_OLDSCAN").is_some() { index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc)); } else { scan::lines::<4>(slice, |f| parse_click(f, &ctx, aliases, pc, tsc)); }
                 }
                 st.prof[(t >= n_event_chunks) as usize] += tt.elapsed().as_secs_f64();
             },
