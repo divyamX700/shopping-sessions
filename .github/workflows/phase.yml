@@ -21,7 +21,7 @@ jobs:
           nproc; lscpu | grep -E "Model name"
           sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -q linux-tools-azure >/dev/null 2>&1 || true
           cargo build --release -q --manifest-path tools/generator/Cargo.toml
-          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" cargo build --release -q
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -q
           git clone -q https://github.com/loveconnor/larp-shopping-sessions-v5 /tmp/larp
           (cd /tmp/larp/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
           tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" | tail -1
@@ -32,7 +32,7 @@ jobs:
           O=./target/release/shopping; L=/tmp/larp/native/target/release/shopping-sessions; N=$(nproc)
           for r in 1 2 3; do
             echo "---- larp"; env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$N $L 2>&1 | tail -3
-            echo "---- ours"; env SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$N MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_PREAD=1 $EXTRA $O 2>&1 | grep -vE "encode thread" | sed -E 's/VmRSS.*//'
+            echo "---- ours"; env SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$N MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_POPULATE=1 $EXTRA $O 2>&1 | grep -vE "encode thread" | sed -E 's/VmRSS.*//'
           done
       - name: Perf
         env:
@@ -40,10 +40,18 @@ jobs:
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=-1 >/dev/null; sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
           O=./target/release/shopping; L=/tmp/larp/native/target/release/shopping-sessions; N=$(nproc)
-          env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$N MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_PREAD=1 $EXTRA perf record -F 2999 -g -o ours.data $O 2>&1 | tail -1
+          env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$N MIMALLOC_ALLOW_LARGE_OS_PAGES=1 SHOP_POPULATE=1 $EXTRA perf record -F 2999 -g -o ours.data $O 2>&1 | tail -1
           perf report -i ours.data --stdio --no-children --sort symbol --percent-limit 0.7 2>/dev/null | grep -E "^ +[0-9]" | cut -c1-160 | head -30
           env DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR=$(mktemp -d) NCPU=$N perf record -F 2999 -g -o larp.data $L 2>&1 | tail -1
           perf report -i larp.data --stdio --no-children --sort dso --percent-limit 0.5 2>/dev/null | grep -E "^ +[0-9]" | head -8
           perf report -i larp.data --stdio --no-children --sort symbol --percent-limit 0.7 2>/dev/null | grep -E "\[k\]" | head -12
           echo "---- ours kernel"
           perf report -i ours.data --stdio --no-children --sort symbol --percent-limit 0.4 2>/dev/null | grep -E "\[k\]" | head -12
+      - name: Annotate hottest
+        env:
+          EXTRA: ${{ inputs.env }}
+        run: |
+          for sym in $(perf report -i ours.data --stdio --no-children --sort symbol 2>/dev/null | grep -E "^ +[0-9]" | grep -v "\[k\]" | awk '{print $3}' | head -5); do
+            echo "==== $sym"
+            perf annotate -i ours.data --stdio -l "$sym" 2>/dev/null | grep -E "^\s+[0-9]+\.[0-9]+" | sort -rn | head -25 | cut -c1-160
+          done
