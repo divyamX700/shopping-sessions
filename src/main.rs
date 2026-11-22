@@ -1461,6 +1461,14 @@ fn main() {
             .iter()
             .filter_map(|p| {
                 let f = std::fs::File::open(p).ok()?;
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::fd::AsRawFd;
+                    unsafe extern "C" {
+                        fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+                    }
+                    unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, 2) }; // SEQUENTIAL
+                }
                 (f.metadata().map(|m| m.len()).unwrap_or(0) > 0).then_some(f)
             })
             .collect()
