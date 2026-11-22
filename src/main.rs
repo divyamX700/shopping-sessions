@@ -1385,6 +1385,8 @@ fn main() {
         keys::EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let profile = std::env::var_os("SHOP_PROFILE").is_some();
+    let pe_plain = std::env::var_os("SHOP_PE_PLAIN").is_some();
+    let pc_plain = std::env::var_os("SHOP_PC_PLAIN").is_some();
     sink::NO_NT.store(std::env::var_os("SHOP_NONT").is_some(), AtomicOrdering::Relaxed);
     let diag2_on = std::env::var_os("SHOP_DIAG2").is_some();
     #[cfg(target_os = "linux")]
@@ -1518,7 +1520,7 @@ fn main() {
                 tsc: ts::DateCache::new(),
                 prof: [0.0; 2],
                 ev: Sink::new(&ev_region, P),
-                pc: Sink::new(&pc_region, Q),
+                pc: { let mut s = Sink::new(&pc_region, Q); s.plain = pc_plain; s },
             },
             |st, t| {
                 let tt = Instant::now();
@@ -1599,7 +1601,7 @@ fn main() {
         threads,
         P,
         || P2 {
-            pe: Sink::new(if recycle_ev { &ev_region } else { &pe_region }, Q),
+            pe: { let mut s = Sink::new(if recycle_ev { &ev_region } else { &pe_region }, Q); s.plain = pe_plain; s },
             seen: Vec::new(),
             coll: Vec::new(),
             dups: SmallIndex::new(1024),

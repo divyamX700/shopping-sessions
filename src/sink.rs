@@ -125,6 +125,8 @@ pub struct Sink<'r, T: Copy> {
     cur: Vec<*mut T>,
     left: Vec<usize>,
     base: Vec<*mut T>,
+    /// Normal stores for this sink (its records are read back soon).
+    pub plain: bool,
     full: Vec<Vec<*mut T>>,
 }
 
@@ -147,6 +149,7 @@ impl<'r, T: Copy + Default> Sink<'r, T> {
             cur: vec![std::ptr::null_mut(); parts],
             left: vec![0; parts],
             base: vec![std::ptr::null_mut(); parts],
+            plain: false,
             full: (0..parts).map(|_| Vec::new()).collect(),
         }
     }
@@ -173,7 +176,7 @@ impl<'r, T: Copy + Default> Sink<'r, T> {
             let src = self.stage.as_ptr().add(p * k) as *const u8;
             let dst = self.cur[p] as *mut u8;
             let bytes = k * std::mem::size_of::<T>();
-            if bytes == STAGE_BYTES && !NO_NT.load(Ordering::Relaxed) {
+            if bytes == STAGE_BYTES && !self.plain && !NO_NT.load(Ordering::Relaxed) {
                 stream128(dst, src);
             } else {
                 std::ptr::copy_nonoverlapping(src, dst, bytes);
