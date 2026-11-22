@@ -1,0 +1,37 @@
+name: cmp
+
+# Phase-by-phase comparison of our binary with another public pipeline,
+# same machine, same data, alternating runs.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Extra env for our runs"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  cmp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          nproc; lscpu | grep "Model name"; grep -o -m1 avx512bw /proc/cpuinfo || echo "no avx512"
+          cargo build --release -q --manifest-path tools/generator/Cargo.toml
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q
+          git clone -q https://github.com/loveconnor/larp-shopping-sessions-v5 /tmp/larp
+          (cd /tmp/larp/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
+          ls /tmp/larp/native/target/release/ | head
+          tools/generator/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" | tail -1
+      - name: Compare
+        run: |
+          L=$(find /tmp/larp/native/target/release -maxdepth 1 -type f -executable | head -1)
+          for r in 1 2 3; do
+            o=$(mktemp -d); s=$(date +%s.%N); DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) $L 2>&1 | tail -1; e=$(date +%s.%N); echo "larp wall $(python3 -c "print(round($e-$s,3))")"
+            o=$(mktemp -d); s=$(date +%s.%N); env ${{ github.event.inputs.env }} SHOP_PROFILE=1 DATA_DIR="$RUNNER_TEMP/p20" OUTPUT_DIR="$o" NCPU=$(nproc) ./target/release/shopping 2>&1 | grep -E "s (setup|parse|dedup|sessions|write)$|cpu" | tr '\n' ' '; e=$(date +%s.%N); echo; echo "ours wall $(python3 -c "print(round($e-$s,3))")"
+          done
