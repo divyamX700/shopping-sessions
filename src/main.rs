@@ -56,6 +56,8 @@ const P: usize = 1 << P_BITS;
 const Q_BITS: u32 = env_num(option_env!("SHOP_Q_BITS"), 10) as u32;
 const Q: usize = 1 << Q_BITS;
 const NONE: u32 = u32::MAX;
+/// Dedup bitmap bits per event (false-positive rate ~1/DEDUP_BITS).
+const DEDUP_BITS: usize = env_num(option_env!("SHOP_DEDUP_BITS"), 16);
 const CHUNK: usize = env_num(option_env!("SHOP_CHUNK_KB"), 512) << 10;
 const EMPTY: u64 = u64::MAX;
 /// `ip` = ingest seconds (biased, 40 bits) << 24 | price (24 bits).
@@ -1647,7 +1649,7 @@ fn main() {
             if n == 0 {
                 return;
             }
-            let bits = (n * 16).next_power_of_two().max(64);
+            let bits = (n * DEDUP_BITS).next_power_of_two().max(64);
             let fmask = bits as u64 - 1;
             st.seen.clear();
             st.seen.resize(bits / 64, 0);
