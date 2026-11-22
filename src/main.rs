@@ -1560,17 +1560,25 @@ fn main() {
     // In the rare case a key is shared or a comparison could not be settled,
     // run again from the start with exact long-ID interning (nothing is written yet).
     lap("parse-joined");
-    if !keys::verify_longs(threads) {
-        if profile {
-            eprintln!("long IDs: key collision or undecided comparison -> exact re-run");
+    // The long-ID check runs alongside phase 2, which only needs the keys;
+    // its answer is needed before phase 3 (output and click-key ties).
+    let verify = {
+        let vt = (threads / 2).max(1);
+        std::thread::spawn(move || keys::verify_longs(vt))
+    };
+    let finish_verify = |verify: std::thread::JoinHandle<bool>| {
+        if !verify.join().unwrap_or(false) {
+            if profile {
+                eprintln!("long IDs: key collision or undecided comparison -> exact re-run");
+            }
+            let status = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+                .args(std::env::args_os().skip(1))
+                .env("SHOP_EXACT_LONG", "1")
+                .status()
+                .expect("exact re-run");
+            std::process::exit(status.code().unwrap_or(1));
         }
-        let status = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .args(std::env::args_os().skip(1))
-            .env("SHOP_EXACT_LONG", "1")
-            .status()
-            .expect("exact re-run");
-        std::process::exit(status.code().unwrap_or(1));
-    }
+    };
     if profile {
         let ev: f64 = p1.iter().map(|w| w.prof[0]).sum();
         let cl: f64 = p1.iter().map(|w| w.prof[1]).sum();
@@ -1679,6 +1687,8 @@ fn main() {
     }
     // p1 stays alive: its click sinks feed phase 3. Nothing is freed until exit.
     lap("dedup");
+    finish_verify(verify);
+    lap("verified");
 
     // Phase 3: group by person, sessions, attribution, aggregation. Each
     // worker writes its own user_daily file as soon as it runs out of work.
