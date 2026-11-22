@@ -241,6 +241,18 @@ fn pool_finish<S: Send>(
     })
 }
 
+/// Bytes [a, b) of `f` read into `buf` (with 64 zero bytes after them).
+fn read_chunk<'b>(f: &std::fs::File, a: usize, b: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
+    use std::os::unix::fs::FileExt;
+    let n = b - a;
+    if buf.len() < n + 64 {
+        buf.resize(n + 64, 0);
+    }
+    f.read_exact_at(&mut buf[..n], a as u64).expect("read input");
+    buf[n..n + 64].fill(0);
+    &buf[..n]
+}
+
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -748,6 +760,8 @@ impl SmallIndex {
 }
 
 struct P1<'r> {
+    /// Chunk buffer for pread input (SHOP_PREAD), with zero padding.
+    rbuf: Vec<u8>,
     idx: index::Index,
     tsc: ts::DateCache,
     prof: [f64; 2],
@@ -1214,6 +1228,21 @@ fn main() {
     }
     let event_files = map_files(&list_csv(&data.join("events")));
     let click_files = map_files(&list_csv(&data.join("clicks")));
+    // pread input: one large read per chunk instead of page faults on a
+    // mapping (much better when the page cache is cold). Same files, same
+    // order as map_files.
+    let pread_input = std::env::var_os("SHOP_PREAD").is_some();
+    let open_nonempty = |dir: &str| -> Vec<std::fs::File> {
+        list_csv(&data.join(dir))
+            .iter()
+            .filter_map(|p| {
+                let f = std::fs::File::open(p).ok()?;
+                (f.metadata().map(|m| m.len()).unwrap_or(0) > 0).then_some(f)
+            })
+            .collect()
+    };
+    let event_fds = if pread_input { open_nonempty("events") } else { Vec::new() };
+    let click_fds = if pread_input { open_nonempty("clicks") } else { Vec::new() };
     let link_paths = list_csv(&data.join("links"));
     let event_chunks = chunks(&event_files);
     let click_chunks = chunks(&click_files);
@@ -1247,6 +1276,7 @@ fn main() {
             threads,
             n_event_chunks + click_chunks.len(),
             || P1 {
+                rbuf: Vec::new(),
                 idx: index::Index::new(),
                 tsc: ts::DateCache::new(),
                 prof: [0.0; 2],
@@ -1257,12 +1287,22 @@ fn main() {
                 let tt = Instant::now();
                 if t < n_event_chunks {
                     let (fi, a, b) = event_chunks[t];
-                    let slice = &event_files[fi][a..b];
+                    let slice: &[u8] = if pread_input {
+                        read_chunk(&event_fds[fi], a, b, &mut st.rbuf)
+                    } else {
+                        &event_files[fi][a..b]
+                    };
+                    let slice: &[u8] = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
                     let (idx, ev, tsc) = (&mut st.idx, &mut st.ev, &mut st.tsc);
                     if std::env::var_os("SHOP_OLDSCAN").is_some() { index::scan_indexed::<7>(slice, idx, |f| parse_event(f, &ctx, ev, tsc)); } else { scan::lines::<7>(slice, |f| parse_event(f, &ctx, ev, tsc)); }
                 } else {
                     let (fi, a, b) = click_chunks[t - n_event_chunks];
-                    let slice = &click_files[fi][a..b];
+                    let slice: &[u8] = if pread_input {
+                        read_chunk(&click_fds[fi], a, b, &mut st.rbuf)
+                    } else {
+                        &click_files[fi][a..b]
+                    };
+                    let slice: &[u8] = unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) };
                     let aliases = aliases_cell.wait();
                     let (idx, pc, tsc) = (&mut st.idx, &mut st.pc, &mut st.tsc);
                     if std::env::var_os("SHOP_OLDSCAN").is_some() { index::scan_indexed::<4>(slice, idx, |f| parse_click(f, &ctx, aliases, pc, tsc)); } else { scan::lines::<4>(slice, |f| parse_click(f, &ctx, aliases, pc, tsc)); }
